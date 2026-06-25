@@ -1,0 +1,48 @@
+name: terminus_2
+install_cmd: bash setup.sh
+run_cmd: >-
+  bash -c 'problem_path="$1"; model="$2"; temperature="$3"; max_turns="$4"; parser="$5"; reasoning="$6"; reasoning_effort="$7"; api_base="$8";
+  set -- terminus2 run --problem-path "$problem_path" -m "$model" --logs-dir /logs/terminus2;
+  [ -n "$temperature" ] && set -- "$@" --temperature "$temperature";
+  [ -n "$max_turns" ] && set -- "$@" --max-turns "$max_turns";
+  [ -n "$parser" ] && set -- "$@" --parser "$parser";
+  case "$reasoning" in True|true) set -- "$@" --reasoning;; False|false) set -- "$@" --no-reasoning;; esac;
+  [ -n "$reasoning_effort" ] && set -- "$@" --reasoning-effort "$reasoning_effort";
+  [ -n "$api_base" ] && set -- "$@" --api-base "$api_base";
+  exec "$@"'
+  _ "{problem_statement_path}" "{model}" "{temperature}" "{max_turns}" "{parser}" "{reasoning}" "{reasoning_effort}" "{api_base}"
+final_output: /logs/terminus2
+ingest_lambda: analysis-terminus2
+defaults:
+  model:
+    type: str
+    required: true
+kwargs:
+  temperature:
+    type: str
+    required: false
+    default: ""
+  max_turns:
+    type: str
+    required: false
+    default: ""
+  parser:
+    type: str
+    required: false
+    default: ""
+  reasoning:
+    type: str
+    required: false
+    default: ""
+  reasoning_effort:
+    type: str
+    required: false
+    default: ""
+  api_base:
+    type: str
+    required: false
+    default: ""
+secrets:
+  OPENAI_API_KEY: prodBenchmarksInfraApiKeys
+  GOOGLE_API_KEY: prodBenchmarksInfraApiKeys
+  ANTHROPIC_API_KEY: prodBenchmarksInfraApiKeys
