@@ -43,6 +43,6 @@ kwargs:
     required: false
     default: ""
 secrets:
-  OPENAI_API_KEY: prodBenchmarksInfraApiKeys
-  GOOGLE_API_KEY: prodBenchmarksInfraApiKeys
-  ANTHROPIC_API_KEY: prodBenchmarksInfraApiKeys
+  OPENAI_API_KEY: devOpenAIApiKey
+  GOOGLE_API_KEY: devGoogleApiKey
+  ANTHROPIC_API_KEY: devAnthropicApiKey
