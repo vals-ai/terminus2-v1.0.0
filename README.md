@@ -6,10 +6,7 @@ For local CLI usage, install the package with `uv sync` and run `terminus2 --hel
 
 ## Configuration
 
-- Secrets:
-  - `OPENAI_API_KEY`: `devOpenAIApiKey`
-  - `ANTHROPIC_API_KEY`: `devAnthropicApiKey`
-  - `GOOGLE_API_KEY`: `devGoogleApiKey`
+- Secrets: provide provider API keys (e.g. `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`) at run time with `-s <ENV_VAR> <CLOUD_KEYNAME>`
 - Model: required via `--model`
 - Final output: `/logs/terminus2-v1.0.0`
 - Optional kwargs: `temperature`, `max_turns`, `parser`, `reasoning`, `reasoning_effort`, `api_base`
