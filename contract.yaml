@@ -42,7 +42,3 @@ kwargs:
     type: str
     required: false
     default: ""
-secrets:
-  OPENAI_API_KEY: devOpenAIApiKey
-  GOOGLE_API_KEY: devGoogleApiKey
-  ANTHROPIC_API_KEY: devAnthropicApiKey
