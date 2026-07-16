@@ -645,6 +645,11 @@ so ask everything you need to know."""
                 prompt,
                 logging_path=logging_path,
             )
+            # QueryResult.output_text is optional. Some providers can return a
+            # reasoning-only turn, which should be handled like an empty text
+            # response and fed back through the parser instead of crashing the
+            # agent while persisting the response.
+            query_result.output_text = query_result.output_text_str
             request_time_ms = query_result.metadata.duration_seconds * 1000
             self._api_request_times.append(request_time_ms)
 
@@ -708,6 +713,7 @@ so ask everything you need to know."""
                     summary_prompt,
                     logging_path=logging_path,
                 )
+                query_result.output_text = query_result.output_text_str
                 request_time_ms = (query_result.metadata.duration_seconds) * 1000
                 self._api_request_times.append(request_time_ms)
 
