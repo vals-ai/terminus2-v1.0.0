@@ -959,14 +959,7 @@ so ask everything you need to know."""
                                 )
                             ]
                         ),
-                        metrics=Metrics(
-                            prompt_tokens=metadata.in_tokens,
-                            completion_tokens=metadata.out_tokens,
-                            reasoning_tokens=metadata.reasoning_tokens,
-                            cache_read_tokens=metadata.cache_read_tokens,
-                            cache_write_tokens=metadata.cache_write_tokens,
-                            cost_usd=metadata.cost.total if metadata.cost else None,
-                        ),
+                        metrics=Metrics.from_query_result_metadata(metadata),
                     )
                 )
                 continue
@@ -1077,14 +1070,7 @@ so ask everything you need to know."""
                     reasoning_content=query_result.reasoning,
                     tool_calls=tool_calls,
                     observation=Observation(results=observation_results),
-                    metrics=Metrics(
-                        prompt_tokens=metadata.in_tokens,
-                        completion_tokens=metadata.out_tokens,
-                        reasoning_tokens=metadata.reasoning_tokens,
-                        cache_read_tokens=metadata.cache_read_tokens,
-                        cache_write_tokens=metadata.cache_write_tokens,
-                        cost_usd=metadata.cost.total if metadata.cost else None,
-                    ),
+                    metrics=Metrics.from_query_result_metadata(metadata),
                 )
             )
 
@@ -1209,14 +1195,7 @@ so ask everything you need to know."""
                     model_name=self._model_name,
                     message=query_result.output_text,
                     reasoning_content=query_result.reasoning,
-                    metrics=Metrics(
-                        prompt_tokens=metadata.in_tokens,
-                        completion_tokens=metadata.out_tokens,
-                        reasoning_tokens=metadata.reasoning_tokens,
-                        cache_read_tokens=metadata.cache_read_tokens,
-                        cache_write_tokens=metadata.cache_write_tokens,
-                        cost_usd=metadata.cost.total if metadata.cost else None,
-                    ),
+                    metrics=Metrics.from_query_result_metadata(metadata),
                 )
             )
         else:
@@ -1267,13 +1246,14 @@ so ask everything you need to know."""
                 },
             ),
             steps=steps,
-            final_metrics=FinalMetrics(
-                total_prompt_tokens=result_metadata.in_tokens,
-                total_completion_tokens=result_metadata.out_tokens,
-                total_reasoning_tokens=result_metadata.reasoning_tokens,
-                total_cache_read_tokens=result_metadata.cache_read_tokens,
-                total_cache_write_tokens=result_metadata.cache_write_tokens,
-                total_cost_usd=result_metadata.cost.total if result_metadata.cost else None,
+            final_metrics=FinalMetrics.from_token_counts(
+                input_tokens=result_metadata.in_tokens,
+                output_tokens=result_metadata.out_tokens,
+                reasoning_tokens=result_metadata.reasoning_tokens,
+                cache_read_tokens=result_metadata.cache_read_tokens,
+                cache_write_tokens=result_metadata.cache_write_tokens,
+                cost_usd=result_metadata.cost.total if result_metadata.cost else None,
+                total_steps=len(steps),
             ),
         )
 
@@ -1387,13 +1367,15 @@ so ask everything you need to know."""
             return
 
         # Construct the trajectory using Pydantic models for validation
-        final_metrics = FinalMetrics(
-            total_prompt_tokens=self._context.n_input_tokens,
-            total_completion_tokens=self._context.n_output_tokens,
-            total_reasoning_tokens=self._context.n_reasoning_tokens,
-            total_cache_read_tokens=self._context.n_cache_read_tokens,
-            total_cache_write_tokens=self._context.n_cache_write_tokens,
-            total_cost_usd=self._context.cost_usd if self._context.cost_usd else None,
+        optional_token_totals = self._context.optional_token_totals()
+        final_metrics = FinalMetrics.from_token_counts(
+            input_tokens=self._context.n_input_tokens,
+            output_tokens=self._context.n_output_tokens,
+            reasoning_tokens=optional_token_totals["reasoning_tokens"],
+            cache_read_tokens=optional_token_totals["cache_read_tokens"],
+            cache_write_tokens=optional_token_totals["cache_write_tokens"],
+            cost_usd=self._context.optional_cost_total(),
+            total_steps=len(self._trajectory_steps),
         )
 
         agent_extra = {

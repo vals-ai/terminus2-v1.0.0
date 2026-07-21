@@ -130,6 +130,7 @@ async def _run_agent(args):
     from terminus2.terminus_2 import Terminus2
     from terminus2.agent.context import AgentContext
     from terminus2.environment_local import LocalEnvironment
+    from terminus2.model_patch import current_commit, write_model_patch
     from terminus2.trial.paths import TrialPaths
 
     logs_dir = args.logs_dir.resolve()
@@ -164,6 +165,7 @@ async def _run_agent(args):
     # cd the tmux session to the actual working directory (bash --login resets cwd)
     import os
     cwd = os.getcwd()
+    base_commit = current_commit(Path(cwd))
     await agent._session.send_keys(keys=[f"cd {cwd}", "Enter"])
     import asyncio as _asyncio
     await _asyncio.sleep(0.5)
@@ -173,6 +175,14 @@ async def _run_agent(args):
     print(f"Logs directory: {logs_dir}")
 
     await agent.run(args.instruction, environment, context)
+
+    if base_commit is not None:
+        _ = write_model_patch(
+            Path(cwd),
+            logs_dir,
+            logs_dir / "trajectory.json",
+            base_commit,
+        )
 
     await environment.stop(delete=False)
 

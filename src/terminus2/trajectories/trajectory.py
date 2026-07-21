@@ -12,8 +12,16 @@ from terminus2.trajectories.step import Step
 class Trajectory(BaseModel):
     """Agent Trajectory in ATIF (Agent Trajectory Interchange Format)."""
 
-    schema_version: Literal["ATIF-v1.0", "ATIF-v1.1", "ATIF-v1.2", "ATIF-v1.3", "ATIF-v1.4", "ATIF-v1.5"] = Field(
-        default="ATIF-v1.5",
+    schema_version: Literal[
+        "ATIF-v1.0",
+        "ATIF-v1.1",
+        "ATIF-v1.2",
+        "ATIF-v1.3",
+        "ATIF-v1.4",
+        "ATIF-v1.5",
+        "ATIF-v1.6",
+    ] = Field(
+        default="ATIF-v1.6",
         description="String defining ATIF compatibility",
     )
     session_id: str = Field(
