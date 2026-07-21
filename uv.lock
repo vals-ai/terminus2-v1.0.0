@@ -1789,7 +1789,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.13.5" },
     { name = "dirhash", specifier = ">=0.5.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "model-library", specifier = ">=0.1.28" },
+    { name = "model-library", specifier = "==0.1.28" },
     { name = "shortuuid", specifier = ">=1.0.13" },
     { name = "toml", specifier = ">=0.10.2" },
 ]
