@@ -1002,7 +1002,7 @@ wheels = [
 
 [[package]]
 name = "model-library"
-version = "0.1.26"
+version = "0.1.28"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ai21" },
@@ -1026,9 +1026,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "xai-sdk" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/27/33/3a1dc68f6a5420e4788bf005817f32b5479985abdd2217562b5be096fe1e/model_library-0.1.26.tar.gz", hash = "sha256:527f7823939b522cdeea78fc0daa0dbbeb54293ea8cf7027e1302a9511ffc1ca", size = 675108, upload-time = "2026-06-25T04:46:32.556Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9b/e5/c7598b8ee6d8ca2aab87f924ade5821ab9251937464029387a8e5e12aa1f/model_library-0.1.28.tar.gz", hash = "sha256:9f43a31ce4475e619907c953f204b9353bf73aa84d94638420d188050096357a", size = 833434, upload-time = "2026-07-20T23:14:22.775Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8f/f0/f342f2312311204784394056b21c3cb2d7f2f581bcf70c86d90e586f0cab/model_library-0.1.26-py3-none-any.whl", hash = "sha256:1e540eb4bd6e011c9b2085851d4759f575f0b8cb03216155e8156ec73476c057", size = 284169, upload-time = "2026-06-25T04:46:31.026Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/81/38811681a4e05b46926d1e2327c3db2e980a880fd3055d86411157843291/model_library-0.1.28-py3-none-any.whl", hash = "sha256:e102c93e1e29925f0a4950eadf0e005a5a251470b650496af50bbbe0362017da", size = 348587, upload-time = "2026-07-20T23:14:21.15Z" },
 ]
 
 [[package]]
@@ -1789,7 +1789,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.13.5" },
     { name = "dirhash", specifier = ">=0.5.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "model-library", specifier = "==0.1.26" },
+    { name = "model-library", specifier = "==0.1.28" },
     { name = "shortuuid", specifier = ">=1.0.13" },
     { name = "toml", specifier = ">=0.10.2" },
 ]
