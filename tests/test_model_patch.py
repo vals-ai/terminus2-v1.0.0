@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import replace
@@ -968,6 +969,97 @@ def test_failed_baseline_preflight_cleans_isolated_state(
     assert not state_dir.exists()
 
 
+@pytest.mark.parametrize("change", ["delete", "replace", "retarget"])
+def test_omits_committed_symlink_changes_and_preserves_trajectory(
+    tmp_path: Path, change: str
+) -> None:
+    repo, _ = _repo(tmp_path)
+    (repo / "target.txt").write_text("target\n")
+    (repo / "second-target.txt").write_text("second target\n")
+    link = repo / "tracked-link"
+    link.symlink_to("target.txt")
+    _ = _git(repo, "add", "target.txt", "second-target.txt", "tracked-link")
+    _ = _git(repo, "commit", "-m", "add tracked symlink")
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+
+    link.unlink()
+    if change == "replace":
+        link.write_text("model replacement\n")
+    elif change == "retarget":
+        link.symlink_to("second-target.txt")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original_trajectory = trajectory_path.read_text()
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert trajectory_path.read_text() == original_trajectory
+    assert "model_patch" not in json.loads(trajectory_path.read_text()).get(
+        "extra", {}
+    ).get("vals", {})
+    assert not (logs_dir / "artifacts/model.patch").exists()
+
+
+def test_omits_deleted_gitlink_and_preserves_trajectory(tmp_path: Path) -> None:
+    repo, _ = _repo(tmp_path)
+    dependency = repo / "dependency"
+    dependency.mkdir()
+    _ = _git(dependency, "init")
+    _ = _git(dependency, "config", "user.email", "test@example.com")
+    _ = _git(dependency, "config", "user.name", "Test")
+    (dependency / "dependency.txt").write_text("dependency\n")
+    _ = _git(dependency, "add", "dependency.txt")
+    _ = _git(dependency, "commit", "-m", "dependency")
+    _ = _git(repo, "add", "dependency")
+    _ = _git(repo, "commit", "-m", "add gitlink")
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+
+    shutil.rmtree(dependency)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original_trajectory = trajectory_path.read_text()
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert trajectory_path.read_text() == original_trajectory
+    assert "model_patch" not in json.loads(trajectory_path.read_text()).get(
+        "extra", {}
+    ).get("vals", {})
+    assert not (logs_dir / "artifacts/model.patch").exists()
+
+
+@pytest.mark.parametrize(
+    "mode_line",
+    [
+        "new file mode 120000",
+        "deleted file mode 120000",
+        "old mode 120000",
+        "new mode 160000",
+        "index 0123456..789abcd 160000",
+    ],
+)
+def test_rejects_non_regular_patch_modes(mode_line: str) -> None:
+    patch = f"diff --git a/item b/item\n{mode_line}\n"
+
+    with pytest.raises(ValueError, match="regular files"):
+        _stats_and_paths(patch)
+
+
+def test_accepts_regular_patch_modes() -> None:
+    patch = (
+        "diff --git a/script b/script\n"
+        "old mode 100644\n"
+        "new mode 100755\n"
+        "index 0123456..789abcd 100755\n"
+    )
+
+    assert _stats_and_paths(patch) == (1, 0, 0)
+
+
 @pytest.mark.parametrize(
     "unsafe_header",
     [
@@ -976,9 +1068,25 @@ def test_failed_baseline_preflight_cleans_isolated_state(
         "diff --git a/safe b/safe\n--- a/safe\n+++ /absolute/path\n",
         "diff --git a/safe b/safe\nrename from ../secret\nrename to safe\n",
         'diff --git a/safe b/safe\nrename from "../secret"\nrename to safe\n',
+        'diff --git a/safe b/safe\nrename from "..\\057secret"\nrename to safe\n',
+        'diff --git a/safe b/safe\nrename from "safe"suffix\nrename to safe\n',
+        'diff --git a/safe b/safe\ncopy from "safe\\tname"\ncopy to safe\n',
         "diff --git a/safe b/safe\ncopy from safe\ncopy to /absolute/path\n",
     ],
 )
 def test_rejects_unsafe_patch_paths(unsafe_header: str) -> None:
     with pytest.raises(ValueError, match="unsafe model patch path"):
         _stats_and_paths(unsafe_header)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "rename from safe old name.txt\nrename to safe new name.txt",
+        'copy from "safe old name.txt"\ncopy to "safe new name.txt"',
+    ],
+)
+def test_accepts_safe_metadata_paths_with_spaces(metadata: str) -> None:
+    patch = f"diff --git a/safe b/safe\n{metadata}\n"
+
+    assert _stats_and_paths(patch) == (1, 0, 0)

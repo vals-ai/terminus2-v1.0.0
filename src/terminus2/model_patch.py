@@ -50,6 +50,8 @@ _NON_SECRET_TOKEN_KEYS = frozenset(
     }
 )
 _COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_REGULAR_FILE_MODES = frozenset({"100644", "100755"})
+_PATH_METADATA_PREFIXES = ("rename from ", "rename to ", "copy from ", "copy to ")
 
 
 @dataclass(frozen=True)
@@ -781,6 +783,35 @@ def _safe_path(path: str, prefix: str) -> bool:
     )
 
 
+def _path_from_metadata(line: str) -> str:
+    prefix = next(
+        (
+            candidate
+            for candidate in _PATH_METADATA_PREFIXES
+            if line.startswith(candidate)
+        ),
+        None,
+    )
+    if prefix is None:
+        raise ValueError("unsafe model patch path")
+    raw_path = line.removeprefix(prefix)
+    if not raw_path or "\\" in raw_path:
+        raise ValueError("unsafe model patch path")
+    if raw_path[0] in {'"', "'"}:
+        if len(raw_path) < 2 or raw_path[-1] != raw_path[0]:
+            raise ValueError("unsafe model patch path")
+        try:
+            parts = shlex.split(raw_path)
+        except ValueError as error:
+            raise ValueError("unsafe model patch path") from error
+        if len(parts) != 1:
+            raise ValueError("unsafe model patch path")
+        return parts[0]
+    if '"' in raw_path or "'" in raw_path:
+        raise ValueError("unsafe model patch path")
+    return raw_path
+
+
 def _stats_and_paths(text: str) -> tuple[int, int, int]:
     file_count = additions = deletions = 0
     in_hunk = False
@@ -802,9 +833,22 @@ def _stats_and_paths(text: str) -> tuple[int, int, int]:
                 parts[1] != "/dev/null" and not _safe_path(parts[1], expected_prefix)
             ):
                 raise ValueError("unsafe model patch path")
-        elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
-            parts = shlex.split(line)
-            if len(parts) != 3 or not _safe_path(parts[2], ""):
+        elif line.startswith(
+            ("new file mode ", "deleted file mode ", "old mode ", "new mode ")
+        ):
+            mode = line.rsplit(" ", 1)[-1]
+            if mode not in _REGULAR_FILE_MODES:
+                raise ValueError(
+                    f"model patch entries must be regular files, got mode {mode!r}"
+                )
+        elif line.startswith("index "):
+            parts = line.split()
+            if len(parts) == 3 and parts[-1] not in _REGULAR_FILE_MODES:
+                raise ValueError(
+                    f"model patch entries must be regular files, got mode {parts[-1]!r}"
+                )
+        elif line.startswith(_PATH_METADATA_PREFIXES):
+            if not _safe_path(_path_from_metadata(line), ""):
                 raise ValueError("unsafe model patch path")
         elif line.startswith("@@ "):
             in_hunk = True
