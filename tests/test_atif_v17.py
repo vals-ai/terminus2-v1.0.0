@@ -6,8 +6,8 @@ from terminus2.trajectories.metrics import Metrics
 from terminus2.trajectories.trajectory import Trajectory
 
 
-def test_trajectory_defaults_to_atif_v16() -> None:
-    assert Trajectory.model_fields["schema_version"].default == "ATIF-v1.6"
+def test_trajectory_defaults_to_atif_v17() -> None:
+    assert Trajectory.model_fields["schema_version"].default == "ATIF-v1.7"
 
 
 def test_query_metadata_is_normalized_without_losing_extension_metrics() -> None:

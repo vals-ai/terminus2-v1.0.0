@@ -47,7 +47,7 @@ def _trajectory(path: Path) -> None:
     path.write_text(
         json.dumps(
             {
-                "schema_version": "ATIF-v1.6",
+                "schema_version": "ATIF-v1.7",
                 "agent": {"name": "terminus-2", "version": "2.0.0"},
                 "steps": [{"step_id": 1, "source": "user", "message": "task"}],
             }
