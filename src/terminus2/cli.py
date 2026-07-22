@@ -130,7 +130,11 @@ async def _run_agent(args):
     from terminus2.terminus_2 import Terminus2
     from terminus2.agent.context import AgentContext
     from terminus2.environment_local import LocalEnvironment
-    from terminus2.model_patch import capture_model_patch_baseline, write_model_patch
+    from terminus2.model_patch import (
+        capture_model_patch_baseline,
+        cleanup_model_patch_baseline,
+        write_model_patch,
+    )
     from terminus2.trial.paths import TrialPaths
 
     logs_dir = args.logs_dir.resolve()
@@ -180,17 +184,19 @@ async def _run_agent(args):
     print(f"Terminus 2 agent initialized with model: {args.model}")
     print(f"Logs directory: {logs_dir}")
 
-    await agent.run(args.instruction, environment, context)
+    try:
+        await agent.run(args.instruction, environment, context)
 
-    if baseline is not None:
-        _ = write_model_patch(
-            repo,
-            logs_dir,
-            logs_dir / "trajectory.json",
-            baseline,
-        )
-
-    await environment.stop(delete=False)
+        if baseline is not None:
+            _ = write_model_patch(
+                repo,
+                logs_dir,
+                logs_dir / "trajectory.json",
+                baseline,
+            )
+    finally:
+        cleanup_model_patch_baseline(baseline)
+        await environment.stop(delete=False)
 
 
 def _run_validate(args):

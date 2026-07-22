@@ -6,12 +6,15 @@ import logging
 import os
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 MAX_MODEL_PATCH_BYTES = 10 * 1024 * 1024
+_STATE_DIRECTORY_PREFIX = "vals-model-patch-"
 _BINARY_MARKERS = (b"GIT binary patch", b"Binary files ")
 _DIRECT_SECRET_PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -53,6 +56,7 @@ class ModelPatchBaseline:
     base_commit: str
     tree: str
     excluded_paths: tuple[str, ...] = ()
+    state_dir: str | None = None
 
 
 def _git(
@@ -86,6 +90,44 @@ def _git(
     return stdout
 
 
+def _repository_git_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in (
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_WORK_TREE",
+    ):
+        env.pop(key, None)
+    return env
+
+
+def _real_object_directory(repo: Path) -> Path:
+    raw_path = (
+        _git(repo, "rev-parse", "--git-path", "objects", env=_repository_git_env())
+        .decode()
+        .strip()
+    )
+    object_directory = Path(raw_path)
+    if not object_directory.is_absolute():
+        object_directory = repo / object_directory
+    return object_directory.resolve()
+
+
+def _isolated_git_env(repo: Path, state_dir: Path, index_name: str) -> dict[str, str]:
+    object_directory = state_dir / "objects"
+    object_directory.mkdir(parents=True, exist_ok=True)
+    env = _repository_git_env()
+    env["GIT_INDEX_FILE"] = str(state_dir / index_name)
+    env["GIT_OBJECT_DIRECTORY"] = str(object_directory)
+    env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(_real_object_directory(repo))
+    return env
+
+
 def _relative_excluded_paths(repo: Path, paths: tuple[Path, ...]) -> tuple[str, ...]:
     repo_root = Path(os.path.abspath(repo))
     excluded: set[str] = set()
@@ -103,21 +145,133 @@ def _relative_excluded_paths(repo: Path, paths: tuple[Path, ...]) -> tuple[str, 
     return tuple(sorted(excluded))
 
 
-def _worktree_tree(
+def _is_excluded(path: str, excluded_paths: tuple[str, ...]) -> bool:
+    return any(
+        path == excluded or path.startswith(f"{excluded}/")
+        for excluded in excluded_paths
+    )
+
+
+def _candidate_worktree_paths(
     repo: Path, base_commit: str, excluded_paths: tuple[str, ...]
+) -> tuple[Path, ...]:
+    env = _repository_git_env()
+    commands = (
+        ("diff", "--cached", "--name-only", "--no-renames", "-z", base_commit, "--"),
+        ("diff", "--name-only", "--no-renames", "--no-ext-diff", "-z", "--"),
+        ("ls-files", "--others", "--exclude-standard", "-z", "--"),
+    )
+    paths: set[str] = set()
+    for command in commands:
+        output = _git(repo, *command, max_output_bytes=MAX_MODEL_PATCH_BYTES, env=env)
+        for raw_path in output.split(b"\x00"):
+            if not raw_path:
+                continue
+            path = raw_path.decode("utf-8")
+            if not _safe_path(path, ""):
+                raise ValueError("unsafe model patch candidate path")
+            if not _is_excluded(path, excluded_paths):
+                paths.add(path)
+    return tuple(repo / path for path in sorted(paths))
+
+
+def _preflight_worktree(
+    repo: Path,
+    base_commit: str,
+    excluded_paths: tuple[str, ...],
+    *,
+    validate_content: bool,
+) -> None:
+    candidates = _candidate_worktree_paths(repo, base_commit, excluded_paths)
+    total_bytes = 0
+    regular_files: list[Path] = []
+    for path in candidates:
+        try:
+            file_stat = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("model patch candidates must be regular files")
+        total_bytes += file_stat.st_size
+        if total_bytes > MAX_MODEL_PATCH_BYTES:
+            raise ValueError("model patch candidate files exceed 10 MiB")
+        regular_files.append(path)
+
+    if not validate_content:
+        return
+    bytes_read = 0
+    for path in regular_files:
+        content = path.read_bytes()
+        bytes_read += len(content)
+        if bytes_read > MAX_MODEL_PATCH_BYTES:
+            raise ValueError("model patch candidate files exceed 10 MiB")
+        if b"\x00" in content:
+            raise ValueError("binary model patches are not allowed")
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("model patch candidates must be UTF-8 text") from error
+        if _has_unredacted_secret(text):
+            raise ValueError("model patch contains a potential unredacted secret")
+
+
+def _worktree_tree(
+    repo: Path,
+    base_commit: str,
+    excluded_paths: tuple[str, ...],
+    state_dir: Path,
+    index_name: str,
+    *,
+    validate_content: bool,
 ) -> str:
-    with tempfile.TemporaryDirectory(prefix="vals-model-patch-index-") as temporary_dir:
-        index_path = Path(temporary_dir) / "index"
-        env = {**os.environ, "GIT_INDEX_FILE": str(index_path)}
-        _ = _git(repo, "read-tree", base_commit, env=env)
-        pathspecs = ["."]
-        for path in excluded_paths:
-            pathspecs.append(f":(exclude){path}")
-        _ = _git(repo, "add", "-A", "--", *pathspecs, env=env)
-        tree = _git(repo, "write-tree", env=env).decode().strip()
+    _preflight_worktree(
+        repo,
+        base_commit,
+        excluded_paths,
+        validate_content=validate_content,
+    )
+    env = _isolated_git_env(repo, state_dir, index_name)
+    _ = _git(repo, "read-tree", base_commit, env=env)
+    pathspecs = ["."]
+    for path in excluded_paths:
+        pathspecs.append(f":(exclude){path}")
+    _ = _git(repo, "add", "-A", "--", *pathspecs, env=env)
+    tree = _git(repo, "write-tree", env=env).decode().strip()
     if not _COMMIT_RE.fullmatch(tree):
         raise ValueError("invalid model patch tree id")
     return tree
+
+
+def _best_effort_remove(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _safe_model_patch_state_dir(baseline: ModelPatchBaseline) -> Path | None:
+    if baseline.state_dir is None:
+        return None
+    temporary_root = Path(os.path.abspath(tempfile.gettempdir()))
+    state_dir = Path(os.path.abspath(baseline.state_dir))
+    if state_dir.parent != temporary_root or not state_dir.name.startswith(
+        _STATE_DIRECTORY_PREFIX
+    ):
+        return None
+    return state_dir
+
+
+def cleanup_model_patch_baseline(baseline: ModelPatchBaseline | None) -> None:
+    """Best-effort removal of isolated Git state; never affect agent scoring."""
+    if baseline is None:
+        return
+    state_dir = _safe_model_patch_state_dir(baseline)
+    if state_dir is None:
+        return
+    try:
+        shutil.rmtree(state_dir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 def capture_model_patch_baseline(
@@ -126,25 +280,49 @@ def capture_model_patch_baseline(
     excluded_paths: tuple[Path, ...] = (),
 ) -> ModelPatchBaseline | None:
     """Capture the exact pre-model worktree without changing its real index."""
+    state_dir: Path | None = None
     try:
         base_commit = (
-            _git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+            _git(
+                repo,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+                env=_repository_git_env(),
+            )
+            .decode()
+            .strip()
         )
         if not _COMMIT_RE.fullmatch(base_commit):
             raise ValueError("invalid model patch base commit")
         relative_exclusions = _relative_excluded_paths(repo, excluded_paths)
+        state_dir = Path(tempfile.mkdtemp(prefix=_STATE_DIRECTORY_PREFIX))
         return ModelPatchBaseline(
             base_commit=base_commit,
-            tree=_worktree_tree(repo, base_commit, relative_exclusions),
+            tree=_worktree_tree(
+                repo,
+                base_commit,
+                relative_exclusions,
+                state_dir,
+                "baseline-index",
+                validate_content=False,
+            ),
             excluded_paths=relative_exclusions,
+            state_dir=str(state_dir),
         )
     except Exception as error:
+        if state_dir is not None:
+            cleanup_model_patch_baseline(
+                ModelPatchBaseline("", "", state_dir=str(state_dir))
+            )
         logging.getLogger(__name__).warning("Model patch baseline omitted: %s", error)
         return None
 
 
 def _safe_path(path: str, prefix: str) -> bool:
-    if not path.startswith(prefix):
+    if not path.startswith(prefix) or any(
+        ord(character) < 32 or ord(character) == 127 for character in path
+    ):
         return False
     value = path.removeprefix(prefix)
     parts = value.split("/")
@@ -243,11 +421,16 @@ def write_model_patch(
 ) -> bool:
     """Write an optional validated model patch and attach its ATIF reference."""
     patch_path = logs_dir / "artifacts/model.patch"
+    patch_temp_path = logs_dir / "artifacts/.model.patch.tmp"
+    reference_temp_path = trajectory_path.with_suffix(".json.tmp")
     try:
         if not _COMMIT_RE.fullmatch(baseline.base_commit) or not _COMMIT_RE.fullmatch(
             baseline.tree
         ):
             raise ValueError("invalid model patch baseline")
+        state_dir = _safe_model_patch_state_dir(baseline)
+        if state_dir is None or not state_dir.is_dir():
+            raise ValueError("model patch isolated state is unavailable")
         try:
             relative_logs = logs_dir.resolve().relative_to(repo.resolve()).as_posix()
         except ValueError:
@@ -255,10 +438,18 @@ def write_model_patch(
         if relative_logs == ".":
             raise ValueError("model patch requires logs outside the repository root")
 
-        final_tree = _worktree_tree(repo, baseline.base_commit, baseline.excluded_paths)
+        final_tree = _worktree_tree(
+            repo,
+            baseline.base_commit,
+            baseline.excluded_paths,
+            state_dir,
+            "final-index",
+            validate_content=True,
+        )
         diff_paths = ["."]
         if relative_logs is not None:
             diff_paths.append(f":(exclude){relative_logs}/**")
+        isolated_env = _isolated_git_env(repo, state_dir, "final-index")
         tracked = _git(
             repo,
             "diff",
@@ -271,6 +462,7 @@ def write_model_patch(
             "--",
             *diff_paths,
             max_output_bytes=MAX_MODEL_PATCH_BYTES,
+            env=isolated_env,
         )
         patch = tracked
         if not patch:
@@ -285,7 +477,8 @@ def write_model_patch(
             raise ValueError("model patch contains a potential unredacted secret")
 
         patch_path.parent.mkdir(parents=True, exist_ok=True)
-        patch_path.write_bytes(patch)
+        patch_temp_path.write_bytes(patch)
+        patch_temp_path.replace(patch_path)
         _write_reference(
             trajectory_path,
             {
@@ -300,6 +493,10 @@ def write_model_patch(
         )
         return True
     except Exception as error:
-        patch_path.unlink(missing_ok=True)
+        _best_effort_remove(patch_path)
+        _best_effort_remove(patch_temp_path)
+        _best_effort_remove(reference_temp_path)
         logging.getLogger(__name__).warning("Model patch omitted: %s", error)
         return False
+    finally:
+        cleanup_model_patch_baseline(baseline)

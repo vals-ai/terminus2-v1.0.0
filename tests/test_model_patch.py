@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import terminus2.model_patch as model_patch_module
 
 from terminus2.model_patch import (
     MAX_MODEL_PATCH_BYTES,
@@ -51,6 +53,22 @@ def _trajectory(path: Path) -> None:
     )
 
 
+def _object_inventory(repo: Path) -> tuple[str, tuple[tuple[str, int, str], ...]]:
+    object_dir = Path(_git(repo, "rev-parse", "--git-path", "objects"))
+    if not object_dir.is_absolute():
+        object_dir = repo / object_dir
+    files = tuple(
+        (
+            path.relative_to(object_dir).as_posix(),
+            path.stat().st_size,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in sorted(object_dir.rglob("*"))
+        if path.is_file()
+    )
+    return _git(repo, "count-objects", "-v"), files
+
+
 def test_baseline_uses_isolated_index_and_diffs_model_changes_only(
     tmp_path: Path,
 ) -> None:
@@ -88,8 +106,13 @@ def test_baseline_uses_isolated_index_and_diffs_model_changes_only(
 
 def test_writes_text_patch_and_atif_reference(tmp_path: Path) -> None:
     repo, base_commit = _repo(tmp_path)
+    objects_before = _object_inventory(repo)
     baseline = capture_model_patch_baseline(repo)
     assert baseline is not None
+    assert baseline.state_dir is not None
+    state_dir = Path(baseline.state_dir)
+    assert state_dir.is_dir()
+    assert _object_inventory(repo) == objects_before
     (repo / "example.py").write_text("value = 2\n")
     (repo / "new.py").write_text("new_value = 3\n")
     logs_dir = tmp_path / "logs"
@@ -111,6 +134,8 @@ def test_writes_text_patch_and_atif_reference(tmp_path: Path) -> None:
         "additions": 2,
         "deletions": 1,
     }
+    assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
 
 
 def test_diffs_preexisting_untracked_file_from_its_pre_model_content(
@@ -223,8 +248,12 @@ def test_omits_patch_when_diff_contains_secret(
     tmp_path: Path, secret_line: str
 ) -> None:
     repo, _ = _repo(tmp_path)
+    objects_before = _object_inventory(repo)
     baseline = capture_model_patch_baseline(repo)
     assert baseline is not None
+    assert baseline.state_dir is not None
+    state_dir = Path(baseline.state_dir)
+    assert _object_inventory(repo) == objects_before
     (repo / "example.py").write_text(f"{secret_line}\n")
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
@@ -235,6 +264,8 @@ def test_omits_patch_when_diff_contains_secret(
     assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
     assert not (logs_dir / "artifacts/model.patch").exists()
     assert trajectory_path.read_text() == original
+    assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
 
 
 @pytest.mark.parametrize(
@@ -292,8 +323,11 @@ def test_allows_known_non_secret_token_metrics(
 
 def test_omits_binary_patch(tmp_path: Path) -> None:
     repo, _ = _repo(tmp_path)
+    objects_before = _object_inventory(repo)
     baseline = capture_model_patch_baseline(repo)
     assert baseline is not None
+    assert baseline.state_dir is not None
+    state_dir = Path(baseline.state_dir)
     (repo / "asset.bin").write_bytes(b"\x00\x01\x02")
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
@@ -302,6 +336,73 @@ def test_omits_binary_patch(tmp_path: Path) -> None:
 
     assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
     assert not (logs_dir / "artifacts/model.patch").exists()
+    assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
+
+
+def test_omits_non_utf8_patch_without_writing_repository_objects(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    objects_before = _object_inventory(repo)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    assert baseline.state_dir is not None
+    state_dir = Path(baseline.state_dir)
+    (repo / "invalid.txt").write_bytes(b"\xff\xfe")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert not (logs_dir / "artifacts/model.patch").exists()
+    assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
+
+
+def test_omits_unsafe_candidate_path_without_writing_repository_objects(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    objects_before = _object_inventory(repo)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    assert baseline.state_dir is not None
+    state_dir = Path(baseline.state_dir)
+    (repo / "unsafe\npath.txt").write_text("model output\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert not (logs_dir / "artifacts/model.patch").exists()
+    assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
+
+
+def test_omits_symlink_candidate_without_writing_repository_objects(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    objects_before = _object_inventory(repo)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    assert baseline.state_dir is not None
+    state_dir = Path(baseline.state_dir)
+    target = tmp_path / "outside.txt"
+    target.write_text("outside\n")
+    (repo / "link.txt").symlink_to(target)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert not (logs_dir / "artifacts/model.patch").exists()
+    assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
 
 
 def test_excludes_agent_logs_when_logs_are_inside_worktree(tmp_path: Path) -> None:
@@ -325,8 +426,11 @@ def test_excludes_agent_logs_when_logs_are_inside_worktree(tmp_path: Path) -> No
 
 def test_omits_oversized_patch_without_writing_artifact(tmp_path: Path) -> None:
     repo, _ = _repo(tmp_path)
+    objects_before = _object_inventory(repo)
     baseline = capture_model_patch_baseline(repo)
     assert baseline is not None
+    assert baseline.state_dir is not None
+    state_dir = Path(baseline.state_dir)
     (repo / "large.txt").write_bytes(b"x" * (MAX_MODEL_PATCH_BYTES + 1))
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
@@ -335,6 +439,8 @@ def test_omits_oversized_patch_without_writing_artifact(tmp_path: Path) -> None:
 
     assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
     assert not (logs_dir / "artifacts/model.patch").exists()
+    assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
 
 
 def test_omits_patch_for_invalid_base_commit(tmp_path: Path) -> None:
@@ -369,6 +475,79 @@ def test_reference_collection_failure_is_fail_open(tmp_path: Path) -> None:
     assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
     assert not (logs_dir / "artifacts/model.patch").exists()
     assert trajectory_path.read_text() == original
+
+
+@pytest.mark.parametrize(
+    "blocking_path",
+    [
+        "artifacts/model.patch",
+        "artifacts/.model.patch.tmp",
+        "trajectory.json.tmp",
+    ],
+)
+def test_collection_cleanup_failure_is_fail_open(
+    tmp_path: Path,
+    blocking_path: str,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    objects_before = _object_inventory(repo)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    assert baseline.state_dir is not None
+    state_dir = Path(baseline.state_dir)
+    (repo / "example.py").write_text("value = 2\n")
+    logs_dir = tmp_path / "logs"
+    blocked_path = logs_dir / blocking_path
+    blocked_path.mkdir(parents=True)
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original = trajectory_path.read_text()
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert blocked_path.is_dir()
+    assert trajectory_path.read_text() == original
+    assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
+
+
+def test_no_model_changes_cleans_isolated_state_without_writing_objects(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    objects_before = _object_inventory(repo)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    assert baseline.state_dir is not None
+    state_dir = Path(baseline.state_dir)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original = trajectory_path.read_text()
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert trajectory_path.read_text() == original
+    assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
+
+
+def test_failed_baseline_preflight_cleans_isolated_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    objects_before = _object_inventory(repo)
+    (repo / "large-setup.txt").write_bytes(b"x" * (MAX_MODEL_PATCH_BYTES + 1))
+    state_dir = Path(tempfile.mkdtemp(prefix="vals-model-patch-test-"))
+    monkeypatch.setattr(
+        model_patch_module.tempfile,
+        "mkdtemp",
+        lambda *, prefix: str(state_dir),
+    )
+
+    assert capture_model_patch_baseline(repo) is None
+    assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
 
 
 @pytest.mark.parametrize(

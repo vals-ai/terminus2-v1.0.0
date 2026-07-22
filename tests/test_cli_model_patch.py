@@ -71,3 +71,59 @@ def test_run_captures_pre_model_baseline_and_excludes_private_inputs(
     write.assert_called_once_with(
         repo, logs_dir.resolve(), logs_dir.resolve() / "trajectory.json", baseline
     )
+
+
+def test_run_failure_cleans_model_patch_state_and_stops_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    logs_dir = repo / "logs"
+    events: list[str] = []
+    baseline = ModelPatchBaseline("a" * 40, "b" * 40, state_dir="/isolated/state")
+    session = SimpleNamespace(send_keys=AsyncMock())
+    agent = SimpleNamespace(
+        _session=session,
+        setup=AsyncMock(),
+        run=AsyncMock(side_effect=RuntimeError("agent failed")),
+    )
+    environment = SimpleNamespace(
+        start=AsyncMock(),
+        stop=AsyncMock(side_effect=lambda *args, **kwargs: events.append("stop")),
+    )
+    cleanup = Mock(side_effect=lambda *args: events.append("cleanup"))
+
+    monkeypatch.setattr("terminus2.terminus_2.Terminus2", Mock(return_value=agent))
+    monkeypatch.setattr(
+        "terminus2.environment_local.LocalEnvironment", Mock(return_value=environment)
+    )
+    monkeypatch.setattr(
+        "terminus2.model_patch.capture_model_patch_baseline",
+        Mock(return_value=baseline),
+    )
+    monkeypatch.setattr("terminus2.model_patch.cleanup_model_patch_baseline", cleanup)
+    monkeypatch.setattr(os, "getcwd", lambda: str(repo))
+
+    args = SimpleNamespace(
+        logs_dir=logs_dir,
+        raw_trajectory=False,
+        linear_history=False,
+        model="test/model",
+        parser="json",
+        max_turns=1,
+        temperature=None,
+        max_tokens=None,
+        reasoning=None,
+        reasoning_effort=None,
+        api_base=None,
+        no_summarize=True,
+        instruction="do the task",
+        problem_path=None,
+    )
+
+    with pytest.raises(RuntimeError, match="agent failed"):
+        asyncio.run(_run_agent(args))
+
+    assert events == ["cleanup", "stop"]
+    cleanup.assert_called_once_with(baseline)
