@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import logging
@@ -783,55 +784,74 @@ def _safe_path(path: str, prefix: str) -> bool:
     )
 
 
-def _path_from_metadata(line: str) -> str:
-    prefix = next(
-        (
-            candidate
-            for candidate in _PATH_METADATA_PREFIXES
-            if line.startswith(candidate)
-        ),
-        None,
-    )
-    if prefix is None:
+def _decode_git_path(value: str) -> str:
+    if not value.startswith('"'):
+        return value
+    try:
+        decoded = ast.literal_eval(value)
+    except (SyntaxError, ValueError) as error:
+        raise ValueError("unsafe model patch path") from error
+    if not isinstance(decoded, str):
         raise ValueError("unsafe model patch path")
-    raw_path = line.removeprefix(prefix)
-    if not raw_path or "\\" in raw_path:
+    return decoded
+
+
+def _patch_header_path(value: str) -> str:
+    if not value.startswith('"'):
+        return value.split("\t", 1)[0]
+    try:
+        parts = shlex.split(value, posix=False)
+    except ValueError as error:
+        raise ValueError("unsafe model patch path") from error
+    if len(parts) != 1:
         raise ValueError("unsafe model patch path")
-    if raw_path[0] in {'"', "'"}:
-        if len(raw_path) < 2 or raw_path[-1] != raw_path[0]:
-            raise ValueError("unsafe model patch path")
-        try:
-            parts = shlex.split(raw_path)
-        except ValueError as error:
-            raise ValueError("unsafe model patch path") from error
-        if len(parts) != 1:
-            raise ValueError("unsafe model patch path")
-        return parts[0]
-    if '"' in raw_path or "'" in raw_path:
+    return _decode_git_path(parts[0])
+
+
+def _diff_header_paths(line: str) -> tuple[str, str]:
+    try:
+        parts = shlex.split(line, posix=False)
+    except ValueError as error:
+        raise ValueError("unsafe model patch path") from error
+    if len(parts) == 4:
+        return _decode_git_path(parts[2]), _decode_git_path(parts[3])
+
+    payload = line.removeprefix("diff --git ")
+    if '"' in payload:
         raise ValueError("unsafe model patch path")
-    return raw_path
+    candidates: list[tuple[str, str]] = []
+    offset = 0
+    while (delimiter := payload.find(" b/", offset)) != -1:
+        old_path = payload[:delimiter]
+        new_path = payload[delimiter + 1 :]
+        if _safe_path(old_path, "a/") and _safe_path(new_path, "b/"):
+            candidates.append((old_path, new_path))
+        offset = delimiter + 1
+    if len(candidates) != 1:
+        raise ValueError("unsafe model patch path")
+    return candidates[0]
 
 
 def _stats_and_paths(text: str) -> tuple[int, int, int]:
     file_count = additions = deletions = 0
     in_hunk = False
+    entry_open = False
+    regular_mode_proven = False
     for line in text.splitlines():
         if line.startswith("diff --git "):
-            parts = shlex.split(line)
-            if (
-                len(parts) != 4
-                or not _safe_path(parts[2], "a/")
-                or not _safe_path(parts[3], "b/")
-            ):
+            if entry_open and not regular_mode_proven:
+                raise ValueError("model patch entries must prove a regular file mode")
+            old_path, new_path = _diff_header_paths(line)
+            if not _safe_path(old_path, "a/") or not _safe_path(new_path, "b/"):
                 raise ValueError("unsafe model patch path")
             file_count += 1
+            entry_open = True
+            regular_mode_proven = False
             in_hunk = False
         elif line.startswith("--- ") or line.startswith("+++ "):
-            parts = shlex.split(line)
+            path = _patch_header_path(line[4:])
             expected_prefix = "a/" if line.startswith("--- ") else "b/"
-            if len(parts) != 2 or (
-                parts[1] != "/dev/null" and not _safe_path(parts[1], expected_prefix)
-            ):
+            if path != "/dev/null" and not _safe_path(path, expected_prefix):
                 raise ValueError("unsafe model patch path")
         elif line.startswith(
             ("new file mode ", "deleted file mode ", "old mode ", "new mode ")
@@ -841,14 +861,18 @@ def _stats_and_paths(text: str) -> tuple[int, int, int]:
                 raise ValueError(
                     f"model patch entries must be regular files, got mode {mode!r}"
                 )
+            regular_mode_proven = True
         elif line.startswith("index "):
             parts = line.split()
             if len(parts) == 3 and parts[-1] not in _REGULAR_FILE_MODES:
                 raise ValueError(
                     f"model patch entries must be regular files, got mode {parts[-1]!r}"
                 )
+            if len(parts) == 3:
+                regular_mode_proven = True
         elif line.startswith(_PATH_METADATA_PREFIXES):
-            if not _safe_path(_path_from_metadata(line), ""):
+            path = _decode_git_path(line.split(" ", 2)[2])
+            if not _safe_path(path, ""):
                 raise ValueError("unsafe model patch path")
         elif line.startswith("@@ "):
             in_hunk = True
@@ -858,6 +882,8 @@ def _stats_and_paths(text: str) -> tuple[int, int, int]:
             deletions += 1
     if file_count == 0:
         raise ValueError("model patch contains no file diff")
+    if entry_open and not regular_mode_proven:
+        raise ValueError("model patch entries must prove a regular file mode")
     return file_count, additions, deletions
 
 
@@ -949,6 +975,7 @@ def write_model_patch(
             "diff",
             "--no-ext-diff",
             "--no-textconv",
+            "--no-renames",
             "--unified=3",
             "--no-color",
             baseline.tree,

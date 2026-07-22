@@ -146,6 +146,56 @@ def test_writes_text_patch_and_atif_reference(tmp_path: Path) -> None:
     assert not list((logs_dir / "artifacts").glob(".*.tmp"))
 
 
+def test_writes_core_compatible_patch_for_filename_with_spaces(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    spaced_file = repo / "file with space.txt"
+    spaced_file.write_text("before\n")
+    _ = _git(repo, "add", spaced_file.name)
+    _ = _git(repo, "commit", "-m", "add spaced file")
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    spaced_file.write_text("after\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+
+    assert write_model_patch(repo, logs_dir, trajectory_path, baseline)
+
+    patch = (logs_dir / "artifacts/model.patch").read_text()
+    assert "diff --git a/file with space.txt b/file with space.txt" in patch
+    assert "index " in patch and " 100644" in patch
+    assert _stats_and_paths(patch) == (1, 1, 1)
+
+
+def test_producer_expands_pure_rename_to_entries_with_regular_modes(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    original = repo / "before.txt"
+    renamed = repo / "after.txt"
+    original.write_text("content\n")
+    _ = _git(repo, "add", original.name)
+    _ = _git(repo, "commit", "-m", "add rename source")
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    original.rename(renamed)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+
+    assert write_model_patch(repo, logs_dir, trajectory_path, baseline)
+
+    patch = (logs_dir / "artifacts/model.patch").read_text()
+    assert "deleted file mode 100644" in patch
+    assert "new file mode 100644" in patch
+    assert "rename from " not in patch
+    assert _stats_and_paths(patch) == (2, 1, 1)
+
+
 def test_diffs_preexisting_untracked_file_from_its_pre_model_content(
     tmp_path: Path,
 ) -> None:
@@ -697,8 +747,10 @@ def test_rejects_racing_intermediate_logs_parent_without_writing_outside(
         dir_fd: int | None = None,
     ) -> int:
         nonlocal swapped
+        path_text = os.fsdecode(path)
         if not swapped and (
-            Path(path) == trusted_logs or (path == "logs" and dir_fd is not None)
+            path_text == os.fspath(trusted_logs)
+            or (path_text == "logs" and dir_fd is not None)
         ):
             real_open_path = os.fspath(trusted_parent)
             real_moved_path = os.fspath(moved_parent)
@@ -1061,6 +1113,20 @@ def test_accepts_regular_patch_modes() -> None:
 
 
 @pytest.mark.parametrize(
+    "metadata",
+    [
+        "rename from before.txt\nrename to after.txt",
+        "copy from before.txt\ncopy to after.txt",
+    ],
+)
+def test_rejects_entry_without_proven_regular_mode(metadata: str) -> None:
+    patch = f"diff --git a/before.txt b/after.txt\nsimilarity index 100%\n{metadata}\n"
+
+    with pytest.raises(ValueError, match="prove a regular file mode"):
+        _stats_and_paths(patch)
+
+
+@pytest.mark.parametrize(
     "unsafe_header",
     [
         "diff --git a/../../secret b/../../secret\n",
@@ -1087,6 +1153,60 @@ def test_rejects_unsafe_patch_paths(unsafe_header: str) -> None:
     ],
 )
 def test_accepts_safe_metadata_paths_with_spaces(metadata: str) -> None:
-    patch = f"diff --git a/safe b/safe\n{metadata}\n"
+    patch = f"diff --git a/safe b/safe\nindex 0123456..789abcd 100644\n{metadata}\n"
 
     assert _stats_and_paths(patch) == (1, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        (
+            "diff --git a/file with space.txt b/file with space.txt\n"
+            "index 0123456..789abcd 100644\n"
+            "--- a/file with space.txt\t\n"
+            "+++ b/file with space.txt\t\n"
+            "@@ -1 +1 @@\n"
+            "-before\n"
+            "+after\n"
+        ),
+        (
+            'diff --git "a/safe\\040file.txt" "b/safe\\040file.txt"\n'
+            "index 0123456..789abcd 100644\n"
+            '--- "a/safe\\040file.txt"\n'
+            '+++ "b/safe\\040file.txt"\n'
+            "@@ -1 +1 @@\n"
+            "-before\n"
+            "+after\n"
+        ),
+        (
+            "diff --git a/safe b/safe\n"
+            "index 0123456..789abcd 100644\n"
+            'rename from "safe\\040old.txt"\n'
+            'rename to "safe\\040new.txt"\n'
+        ),
+    ],
+)
+def test_accepts_current_core_compatible_path_encodings(patch: str) -> None:
+    assert _stats_and_paths(patch) == (
+        1,
+        1 if "@@ " in patch else 0,
+        1 if "@@ " in patch else 0,
+    )
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        ('diff --git "a/..\\057secret" b/safe\nindex 0123456..789abcd 100644\n'),
+        (
+            "diff --git a/safe b/safe\n"
+            "index 0123456..789abcd 100644\n"
+            '--- "a/..\\057secret"\n'
+            "+++ b/safe\n"
+        ),
+    ],
+)
+def test_rejects_current_core_unsafe_escaped_headers(patch: str) -> None:
+    with pytest.raises(ValueError, match="unsafe model patch path"):
+        _stats_and_paths(patch)
