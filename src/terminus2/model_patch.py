@@ -28,8 +28,8 @@ _ASSIGNED_SECRET_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])"
     r"[\"']?(?P<key>[A-Za-z0-9_.-]*(?:api[_-]?key|apikey|access[_-]?token|accesstoken|"
     r"authorization|auth|client[_-]?secret|password|private[_-]?key|secret|token)[A-Za-z0-9_.-]*)[\"']?"
-    r"\s*[:=]\s*(?P<value>(?:bearer|basic)\s+(?:\[[^\]\n]+\]|[^\s,}]+)|"
-    r"\"[^\"\n]*\"|'[^'\n]*'|[^\s,}]+)"
+    r"\s*[:=]\s*(?P<value>(?:(?:bearer|basic)\s+)?"
+    r"(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s,};])+)"
 )
 _CREDENTIALED_URL_RE = re.compile(
     r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:(?P<secret>[^@\s/]+)@"
@@ -894,10 +894,17 @@ def _is_explicitly_redacted(value: str) -> bool:
     if value in _REDACTED_VALUES:
         return True
     authorization = value.split(maxsplit=1)
+    credential = authorization[1] if len(authorization) == 2 else ""
+    if (
+        len(credential) >= 2
+        and credential[0] == credential[-1]
+        and credential[0] in {'"', "'"}
+    ):
+        credential = credential[1:-1].strip()
     return (
         len(authorization) == 2
         and authorization[0].lower() in {"bearer", "basic"}
-        and authorization[1] in _REDACTED_VALUES
+        and credential in _REDACTED_VALUES
     )
 
 

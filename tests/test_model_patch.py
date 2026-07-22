@@ -356,6 +356,57 @@ def test_allows_explicitly_redacted_secret_values(
 
 
 @pytest.mark.parametrize(
+    ("secret_line", "should_publish"),
+    [
+        ("Authorization: Bearer [REDACTED]still-secret", False),
+        ('Authorization="Bearer [REDACTED]"still-secret', False),
+        ("Authorization=Bearer '[REDACTED]'still-secret", False),
+        ("Authorization: Basic [REDACTED]still-secret", False),
+        ('Authorization="Basic [REDACTED]"still-secret', False),
+        ('Authorization=Basic "[REDACTED]"still-secret', False),
+        ("API_KEY=[REDACTED]still-secret", False),
+        ('API_KEY="[REDACTED]"still-secret', False),
+        ('API_KEY="[REDACTED"', False),
+        ("endpoint=https://user:[REDACTED]still-secret@example.com/path", False),
+        ("Authorization: Bearer [REDACTED]", True),
+        ('Authorization=Bearer "[REDACTED]"', True),
+        ("Authorization=Basic '<REDACTED>'", True),
+        ('Authorization="Bearer [REDACTED]"', True),
+        ("API_KEY=[REDACTED]", True),
+        ('API_KEY="[REDACTED]"', True),
+        ("endpoint=https://user:[REDACTED]@example.com/path", True),
+    ],
+)
+def test_matches_core_exact_redaction_policy_for_real_patch(
+    tmp_path: Path, secret_line: str, should_publish: bool
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text(f"{secret_line}\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original_trajectory = trajectory_path.read_text()
+
+    assert (
+        write_model_patch(repo, logs_dir, trajectory_path, baseline) is should_publish
+    )
+
+    patch_path = logs_dir / "artifacts/model.patch"
+    trajectory = json.loads(trajectory_path.read_text())
+    if should_publish:
+        assert patch_path.is_file()
+        assert trajectory["extra"]["vals"]["model_patch"]["path"] == (
+            "artifacts/model.patch"
+        )
+    else:
+        assert not patch_path.exists()
+        assert trajectory_path.read_text() == original_trajectory
+
+
+@pytest.mark.parametrize(
     "metric_line",
     [
         "total_tokens = 123",
