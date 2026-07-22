@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 from dataclasses import replace
@@ -660,6 +661,237 @@ def test_rejects_symlinked_logs_parent_component_without_touching_scored_files(
     assert not (real_logs / "artifacts/model.patch").exists()
 
 
+def test_rejects_racing_intermediate_logs_parent_without_writing_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text("value = 2\n")
+
+    trusted_parent = tmp_path / "trusted-parent"
+    trusted_logs = trusted_parent / "logs"
+    trusted_logs.mkdir(parents=True)
+    trusted_trajectory = trusted_logs / "trajectory.json"
+    _trajectory(trusted_trajectory)
+    original_trusted_trajectory = trusted_trajectory.read_text()
+
+    outside_parent = tmp_path / "outside-parent"
+    outside_logs = outside_parent / "logs"
+    outside_logs.mkdir(parents=True)
+    outside_trajectory = outside_logs / "trajectory.json"
+    _trajectory(outside_trajectory)
+    original_outside_trajectory = outside_trajectory.read_text()
+
+    moved_parent = tmp_path / "trusted-parent-original"
+    real_open = model_patch_module.os.open
+    swapped = False
+
+    def racing_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and (
+            Path(path) == trusted_logs or (path == "logs" and dir_fd is not None)
+        ):
+            real_open_path = os.fspath(trusted_parent)
+            real_moved_path = os.fspath(moved_parent)
+            model_patch_module.os.rename(real_open_path, real_moved_path)
+            model_patch_module.os.symlink(
+                os.fspath(outside_parent), real_open_path, target_is_directory=True
+            )
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(model_patch_module.os, "open", racing_open)
+
+    assert not write_model_patch(repo, trusted_logs, trusted_trajectory, baseline)
+    assert swapped
+    assert (moved_parent / "logs/trajectory.json").read_text() == (
+        original_trusted_trajectory
+    )
+    assert outside_trajectory.read_text() == original_outside_trajectory
+    assert not (outside_logs / "artifacts/model.patch").exists()
+
+
+def test_rejects_racing_artifacts_parent_without_writing_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text("value = 2\n")
+    logs_dir = tmp_path / "logs"
+    artifacts_dir = logs_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original_trajectory = trajectory_path.read_text()
+
+    outside_artifacts = tmp_path / "outside-artifacts"
+    outside_artifacts.mkdir()
+    sentinel = outside_artifacts / "sentinel.txt"
+    sentinel.write_text("scored output\n")
+    moved_artifacts = logs_dir / "artifacts-original"
+    real_open = model_patch_module.os.open
+    swapped = False
+
+    def racing_open(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and path == "artifacts" and dir_fd is not None:
+            model_patch_module.os.rename(
+                "artifacts",
+                "artifacts-original",
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+            model_patch_module.os.symlink(
+                os.fspath(outside_artifacts),
+                "artifacts",
+                target_is_directory=True,
+                dir_fd=dir_fd,
+            )
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(model_patch_module.os, "open", racing_open)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert swapped
+    assert sentinel.read_text() == "scored output\n"
+    assert not (outside_artifacts / "model.patch").exists()
+    assert not (moved_artifacts / "model.patch").exists()
+    assert trajectory_path.read_text() == original_trajectory
+
+
+def test_rejects_racing_final_patch_name_without_touching_sentinel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text("value = 2\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original_trajectory = trajectory_path.read_text()
+    sentinel = tmp_path / "scored-output.txt"
+    sentinel.write_text("scored output\n")
+
+    real_link = model_patch_module.os.link
+    injected = False
+
+    def inject_patch(destination: str | bytes | Path, directory_fd: int | None) -> None:
+        nonlocal injected
+        if not injected and destination == "model.patch" and directory_fd is not None:
+            model_patch_module.os.symlink(
+                os.fspath(sentinel), destination, dir_fd=directory_fd
+            )
+            injected = True
+
+    def racing_link(
+        source: str | bytes | Path,
+        destination: str | bytes | Path,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        inject_patch(destination, dst_dir_fd)
+        real_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(model_patch_module.os, "link", racing_link)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert injected
+    assert sentinel.read_text() == "scored output\n"
+    assert (logs_dir / "artifacts/model.patch").is_symlink()
+    assert trajectory_path.read_text() == original_trajectory
+
+
+def test_rejects_racing_final_trajectory_name_without_touching_scored_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text("value = 2\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original_trajectory = trajectory_path.read_text()
+    scored_trajectory = tmp_path / "scored-trajectory.json"
+    _trajectory(scored_trajectory)
+    original_scored_trajectory = scored_trajectory.read_text()
+    moved_trajectory = logs_dir / "trajectory.original.json"
+
+    real_rename = model_patch_module.os.rename
+    injected = False
+
+    def inject_trajectory(source: str | bytes | Path, directory_fd: int | None) -> None:
+        nonlocal injected
+        if not injected and source == "trajectory.json" and directory_fd is not None:
+            real_rename(
+                "trajectory.json",
+                "trajectory.original.json",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            model_patch_module.os.symlink(
+                os.fspath(scored_trajectory),
+                "trajectory.json",
+                dir_fd=directory_fd,
+            )
+            injected = True
+
+    def racing_rename(
+        source: str | bytes | Path,
+        destination: str | bytes | Path,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        inject_trajectory(source, src_dir_fd)
+        real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(model_patch_module.os, "rename", racing_rename)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert injected
+    assert scored_trajectory.read_text() == original_scored_trajectory
+    assert moved_trajectory.read_text() == original_trajectory
+    assert "model_patch" not in json.loads(moved_trajectory.read_text()).get(
+        "extra", {}
+    ).get("vals", {})
+
+
 def test_unique_temp_cleanup_failure_never_escapes_or_mutates_trajectory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -678,10 +910,8 @@ def test_unique_temp_cleanup_failure_never_escapes_or_mutates_trajectory(
 
     monkeypatch.setattr(
         model_patch_module.os,
-        "replace",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            PermissionError("replace denied")
-        ),
+        "link",
+        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("link denied")),
     )
     monkeypatch.setattr(
         model_patch_module.os,

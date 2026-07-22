@@ -265,7 +265,12 @@ def _same_file(left: _FileSnapshot, right: _FileSnapshot) -> bool:
 
 
 def _directory_open_flags() -> int:
-    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
 
 
 def _regular_file_open_flags() -> int:
@@ -279,74 +284,148 @@ def _stat_at(directory_fd: int, name: str) -> os.stat_result | None:
         return None
 
 
-def _validate_directory_components(path: Path) -> None:
+@dataclass(frozen=True)
+class _PinnedDirectory:
+    file_descriptors: tuple[int, ...]
+    component_names: tuple[str, ...]
+    component_snapshots: tuple[_FileSnapshot, ...]
+
+    @property
+    def fd(self) -> int:
+        return self.file_descriptors[-1]
+
+
+@dataclass(frozen=True)
+class _PinnedChildDirectory:
+    parent: _PinnedDirectory
+    name: str
+    fd: int
+    snapshot: _FileSnapshot
+
+
+@dataclass(frozen=True)
+class _PublishedReplacement:
+    destination_name: str
+    published_snapshot: _FileSnapshot
+    backup_name: str
+    backup_snapshot: _FileSnapshot
+
+
+def _open_safe_directory(path: Path) -> _PinnedDirectory:
     absolute_path = Path(os.path.abspath(path))
-    current = Path(absolute_path.anchor)
-    for component in absolute_path.parts[1:]:
-        current /= component
-        component_stat = current.lstat()
-        if not stat.S_ISDIR(component_stat.st_mode):
-            raise ValueError(f"unsafe model patch path component: {current}")
-
-
-def _open_safe_directory(path: Path) -> int:
-    _validate_directory_components(path)
-    before = path.lstat()
-    if not stat.S_ISDIR(before.st_mode):
+    if not absolute_path.anchor:
         raise ValueError(f"unsafe model patch directory: {path}")
-    directory_fd = os.open(path, _directory_open_flags())
+
+    file_descriptors: list[int] = []
+    component_names: list[str] = []
+    component_snapshots: list[_FileSnapshot] = []
     try:
-        opened = os.fstat(directory_fd)
-        after = path.lstat()
-        if not stat.S_ISDIR(opened.st_mode) or not stat.S_ISDIR(after.st_mode):
-            raise ValueError(f"unsafe model patch directory: {path}")
-        if not _same_file(_snapshot(opened), _snapshot(after)):
-            raise ValueError(f"model patch directory changed while opening: {path}")
-        return directory_fd
+        root_fd = os.open(absolute_path.anchor, _directory_open_flags())
+        file_descriptors.append(root_fd)
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            raise ValueError(f"unsafe model patch directory root: {path}")
+
+        for component in absolute_path.parts[1:]:
+            parent_fd = file_descriptors[-1]
+            before = _stat_at(parent_fd, component)
+            if before is None or not stat.S_ISDIR(before.st_mode):
+                raise ValueError(f"unsafe model patch path component: {component}")
+            child_fd = os.open(component, _directory_open_flags(), dir_fd=parent_fd)
+            file_descriptors.append(child_fd)
+            opened = os.fstat(child_fd)
+            after = _stat_at(parent_fd, component)
+            if (
+                after is None
+                or not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(after.st_mode)
+                or not _same_file(_snapshot(before), _snapshot(opened))
+                or not _same_file(_snapshot(opened), _snapshot(after))
+            ):
+                raise ValueError(
+                    f"model patch path component changed while opening: {component}"
+                )
+            component_names.append(component)
+            component_snapshots.append(_snapshot(opened))
+
+        return _PinnedDirectory(
+            file_descriptors=tuple(file_descriptors),
+            component_names=tuple(component_names),
+            component_snapshots=tuple(component_snapshots),
+        )
     except Exception:
-        try:
-            os.close(directory_fd)
-        except Exception:
-            pass
+        for file_fd in reversed(file_descriptors):
+            _best_effort_close(file_fd)
         raise
 
 
-def _revalidate_directory(path: Path, directory_fd: int) -> None:
-    current = path.lstat()
-    opened = os.fstat(directory_fd)
-    if not stat.S_ISDIR(current.st_mode) or not stat.S_ISDIR(opened.st_mode):
-        raise ValueError(f"unsafe model patch directory: {path}")
-    if not _same_file(_snapshot(current), _snapshot(opened)):
-        raise ValueError(f"model patch directory changed: {path}")
+def _revalidate_pinned_directory(directory: _PinnedDirectory) -> None:
+    if len(directory.file_descriptors) != len(directory.component_names) + 1:
+        raise ValueError("invalid pinned model patch directory")
+    for index, (name, expected) in enumerate(
+        zip(directory.component_names, directory.component_snapshots, strict=True)
+    ):
+        parent_fd = directory.file_descriptors[index]
+        child_fd = directory.file_descriptors[index + 1]
+        current = _stat_at(parent_fd, name)
+        opened = os.fstat(child_fd)
+        if (
+            current is None
+            or not stat.S_ISDIR(current.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or not _same_file(expected, _snapshot(current))
+            or not _same_file(expected, _snapshot(opened))
+        ):
+            raise ValueError(f"model patch directory component changed: {name}")
 
 
 def _open_or_create_child_directory(
-    parent_fd: int, parent_path: Path, name: str
-) -> tuple[int, Path]:
+    parent: _PinnedDirectory, name: str
+) -> _PinnedChildDirectory:
     if not _safe_path(name, "") or Path(name).name != name:
         raise ValueError("unsafe model patch directory name")
-    _revalidate_directory(parent_path, parent_fd)
+    _revalidate_pinned_directory(parent)
     try:
-        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        os.mkdir(name, mode=0o700, dir_fd=parent.fd)
     except FileExistsError:
         pass
-    child_stat = _stat_at(parent_fd, name)
+    child_stat = _stat_at(parent.fd, name)
     if child_stat is None or not stat.S_ISDIR(child_stat.st_mode):
         raise ValueError(f"unsafe model patch directory component: {name}")
-    child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    child_fd = os.open(name, _directory_open_flags(), dir_fd=parent.fd)
     try:
         opened = os.fstat(child_fd)
-        if not stat.S_ISDIR(opened.st_mode) or not _same_file(
-            _snapshot(child_stat), _snapshot(opened)
+        after = _stat_at(parent.fd, name)
+        if (
+            after is None
+            or not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(after.st_mode)
+            or not _same_file(_snapshot(child_stat), _snapshot(opened))
+            or not _same_file(_snapshot(opened), _snapshot(after))
         ):
             raise ValueError(f"model patch directory component changed: {name}")
-        return child_fd, parent_path / name
+        return _PinnedChildDirectory(
+            parent=parent,
+            name=name,
+            fd=child_fd,
+            snapshot=_snapshot(opened),
+        )
     except Exception:
-        try:
-            os.close(child_fd)
-        except Exception:
-            pass
+        _best_effort_close(child_fd)
         raise
+
+
+def _revalidate_child_directory(directory: _PinnedChildDirectory) -> None:
+    _revalidate_pinned_directory(directory.parent)
+    current = _stat_at(directory.parent.fd, directory.name)
+    opened = os.fstat(directory.fd)
+    if (
+        current is None
+        or not stat.S_ISDIR(current.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or not _same_file(directory.snapshot, _snapshot(current))
+        or not _same_file(directory.snapshot, _snapshot(opened))
+    ):
+        raise ValueError(f"model patch directory component changed: {directory.name}")
 
 
 def _require_missing_at(directory_fd: int, name: str) -> None:
@@ -446,6 +525,177 @@ def _best_effort_close(file_fd: int | None) -> None:
         os.close(file_fd)
     except Exception:
         pass
+
+
+def _best_effort_close_pinned(directory: _PinnedDirectory | None) -> None:
+    if directory is None:
+        return
+    for file_fd in reversed(directory.file_descriptors):
+        _best_effort_close(file_fd)
+
+
+def _unique_missing_name_at(directory_fd: int, prefix: str) -> str:
+    for _ in range(64):
+        name = f"{prefix}{secrets.token_hex(16)}.tmp"
+        if _stat_at(directory_fd, name) is None:
+            return name
+    raise FileExistsError("could not allocate a unique model patch publication name")
+
+
+def _restore_entry_without_clobbering(
+    directory_fd: int,
+    backup_name: str,
+    destination_name: str,
+    expected: _FileSnapshot,
+) -> None:
+    backup = _stat_at(directory_fd, backup_name)
+    if backup is None or _snapshot(backup) != expected:
+        return
+    try:
+        os.link(
+            backup_name,
+            destination_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except Exception:
+        return
+    restored = _stat_at(directory_fd, destination_name)
+    if restored is not None and _same_file(_snapshot(restored), expected):
+        _best_effort_unlink_at(directory_fd, backup_name, expected)
+
+
+def _publish_missing_regular_at(
+    directory_fd: int,
+    temporary_name: str,
+    temporary_snapshot: _FileSnapshot,
+    destination_name: str,
+) -> _FileSnapshot:
+    current_temporary = _stat_at(directory_fd, temporary_name)
+    if (
+        current_temporary is None
+        or not stat.S_ISREG(current_temporary.st_mode)
+        or _snapshot(current_temporary) != temporary_snapshot
+    ):
+        raise ValueError("model patch temporary file changed during publication")
+    _require_missing_at(directory_fd, destination_name)
+    os.link(
+        temporary_name,
+        destination_name,
+        src_dir_fd=directory_fd,
+        dst_dir_fd=directory_fd,
+        follow_symlinks=False,
+    )
+    final = _stat_at(directory_fd, destination_name)
+    if (
+        final is None
+        or not stat.S_ISREG(final.st_mode)
+        or _snapshot(final) != temporary_snapshot
+    ):
+        _best_effort_unlink_at(directory_fd, destination_name, temporary_snapshot)
+        raise ValueError("model patch artifact changed during publication")
+    os.unlink(temporary_name, dir_fd=directory_fd)
+    return _snapshot(final)
+
+
+def _replace_existing_regular_at(
+    directory_fd: int,
+    temporary_name: str,
+    temporary_snapshot: _FileSnapshot,
+    destination_name: str,
+    destination_snapshot: _FileSnapshot,
+) -> _PublishedReplacement:
+    backup_name = _unique_missing_name_at(
+        directory_fd, f".{destination_name}.original."
+    )
+    moved_snapshot: _FileSnapshot | None = None
+    published_snapshot: _FileSnapshot | None = None
+    try:
+        # Moving the destination first lets us inspect the exact directory entry
+        # captured at the publication boundary without following a replacement
+        # symlink or overwriting a concurrently-created entry.
+        os.rename(
+            destination_name,
+            backup_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        moved = _stat_at(directory_fd, backup_name)
+        if moved is None:
+            raise ValueError("trajectory disappeared during publication")
+        moved_snapshot = _snapshot(moved)
+        if not stat.S_ISREG(moved.st_mode) or moved_snapshot != destination_snapshot:
+            raise ValueError("trajectory changed during publication")
+
+        current_temporary = _stat_at(directory_fd, temporary_name)
+        if (
+            current_temporary is None
+            or not stat.S_ISREG(current_temporary.st_mode)
+            or _snapshot(current_temporary) != temporary_snapshot
+        ):
+            raise ValueError("trajectory temporary file changed during publication")
+        os.link(
+            temporary_name,
+            destination_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        published = _stat_at(directory_fd, destination_name)
+        if (
+            published is None
+            or not stat.S_ISREG(published.st_mode)
+            or _snapshot(published) != temporary_snapshot
+        ):
+            raise ValueError("trajectory changed during publication")
+        published_snapshot = _snapshot(published)
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        return _PublishedReplacement(
+            destination_name=destination_name,
+            published_snapshot=published_snapshot,
+            backup_name=backup_name,
+            backup_snapshot=destination_snapshot,
+        )
+    except Exception:
+        if published_snapshot is not None:
+            _best_effort_unlink_at(directory_fd, destination_name, published_snapshot)
+        if moved_snapshot is not None:
+            _restore_entry_without_clobbering(
+                directory_fd,
+                backup_name,
+                destination_name,
+                moved_snapshot,
+            )
+        raise
+
+
+def _rollback_replacement_at(
+    directory_fd: int | None, replacement: _PublishedReplacement | None
+) -> None:
+    if directory_fd is None or replacement is None:
+        return
+    _best_effort_unlink_at(
+        directory_fd,
+        replacement.destination_name,
+        replacement.published_snapshot,
+    )
+    _restore_entry_without_clobbering(
+        directory_fd,
+        replacement.backup_name,
+        replacement.destination_name,
+        replacement.backup_snapshot,
+    )
+
+
+def _finalize_replacement_at(
+    directory_fd: int, replacement: _PublishedReplacement
+) -> None:
+    _best_effort_unlink_at(
+        directory_fd,
+        replacement.backup_name,
+        replacement.backup_snapshot,
+    )
 
 
 def _safe_model_patch_state_dir(baseline: ModelPatchBaseline) -> Path | None:
@@ -617,11 +867,12 @@ def write_model_patch(
     baseline: ModelPatchBaseline,
 ) -> bool:
     """Write an optional validated model patch and attach its ATIF reference."""
-    logs_fd: int | None = None
-    artifacts_fd: int | None = None
+    logs_directory: _PinnedDirectory | None = None
+    artifacts_directory: _PinnedChildDirectory | None = None
     patch_temp_name: str | None = None
     trajectory_temp_name: str | None = None
     published_patch: _FileSnapshot | None = None
+    published_trajectory: _PublishedReplacement | None = None
     try:
         if not _COMMIT_RE.fullmatch(baseline.base_commit) or not _COMMIT_RE.fullmatch(
             baseline.tree
@@ -684,7 +935,8 @@ def write_model_patch(
                 "trajectory path must be a direct child of the logs directory"
             )
 
-        logs_fd = _open_safe_directory(logs_dir)
+        logs_directory = _open_safe_directory(logs_dir)
+        logs_fd = logs_directory.fd
         trajectory_name = trajectory_path.name
         legacy_reference_temp_name = trajectory_path.with_suffix(".json.tmp").name
         _require_missing_at(logs_fd, legacy_reference_temp_name)
@@ -702,9 +954,10 @@ def write_model_patch(
         }
         updated_trajectory = _trajectory_with_reference(trajectory_content, reference)
 
-        artifacts_fd, artifacts_path = _open_or_create_child_directory(
-            logs_fd, logs_dir, "artifacts"
+        artifacts_directory = _open_or_create_child_directory(
+            logs_directory, "artifacts"
         )
+        artifacts_fd = artifacts_directory.fd
         _require_missing_at(artifacts_fd, ".model.patch.tmp")
         _require_missing_at(artifacts_fd, "model.patch")
         patch_temp_name, patch_temp = _create_secure_temp_file(
@@ -716,8 +969,8 @@ def write_model_patch(
             updated_trajectory,
         )
 
-        _revalidate_directory(logs_dir, logs_fd)
-        _revalidate_directory(artifacts_path, artifacts_fd)
+        _revalidate_pinned_directory(logs_directory)
+        _revalidate_child_directory(artifacts_directory)
         _require_missing_at(logs_fd, legacy_reference_temp_name)
         _require_missing_at(artifacts_fd, ".model.patch.tmp")
         _require_missing_at(artifacts_fd, "model.patch")
@@ -735,22 +988,21 @@ def write_model_patch(
         ):
             raise ValueError("model patch temporary file changed during collection")
 
-        os.replace(
+        published_patch = _publish_missing_regular_at(
+            artifacts_fd,
             patch_temp_name,
+            patch_temp,
             "model.patch",
-            src_dir_fd=artifacts_fd,
-            dst_dir_fd=artifacts_fd,
         )
         patch_temp_name = None
         final_patch = _stat_at(artifacts_fd, "model.patch")
         if final_patch is None or not stat.S_ISREG(final_patch.st_mode):
             raise ValueError("final model patch artifact is not a regular file")
-        published_patch = _snapshot(final_patch)
         if published_patch != patch_temp:
             raise ValueError("model patch artifact changed during publication")
 
-        _revalidate_directory(logs_dir, logs_fd)
-        _revalidate_directory(artifacts_path, artifacts_fd)
+        _revalidate_pinned_directory(logs_directory)
+        _revalidate_child_directory(artifacts_directory)
         current_patch = _stat_at(artifacts_fd, "model.patch")
         current_trajectory = _stat_at(logs_fd, trajectory_name)
         current_trajectory_temp = _stat_at(logs_fd, trajectory_temp_name)
@@ -769,22 +1021,33 @@ def write_model_patch(
             or _snapshot(current_trajectory_temp) != trajectory_temp
         ):
             raise ValueError("trajectory temporary file changed during publication")
-        os.replace(
+        published_trajectory = _replace_existing_regular_at(
+            logs_fd,
             trajectory_temp_name,
+            trajectory_temp,
             trajectory_name,
-            src_dir_fd=logs_fd,
-            dst_dir_fd=logs_fd,
+            original_trajectory,
         )
         trajectory_temp_name = None
+        _revalidate_pinned_directory(logs_directory)
+        _revalidate_child_directory(artifacts_directory)
+        _finalize_replacement_at(logs_fd, published_trajectory)
+        published_trajectory = None
         return True
     except Exception as error:
+        logs_fd = logs_directory.fd if logs_directory is not None else None
+        artifacts_fd = (
+            artifacts_directory.fd if artifacts_directory is not None else None
+        )
         _best_effort_unlink_at(artifacts_fd, patch_temp_name)
         _best_effort_unlink_at(logs_fd, trajectory_temp_name)
+        _rollback_replacement_at(logs_fd, published_trajectory)
         if published_patch is not None:
             _best_effort_unlink_at(artifacts_fd, "model.patch", published_patch)
         logging.getLogger(__name__).warning("Model patch omitted: %s", error)
         return False
     finally:
-        _best_effort_close(artifacts_fd)
-        _best_effort_close(logs_fd)
+        if artifacts_directory is not None:
+            _best_effort_close(artifacts_directory.fd)
+        _best_effort_close_pinned(logs_directory)
         cleanup_model_patch_baseline(baseline)
