@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -242,9 +243,207 @@ def _worktree_tree(
     return tree
 
 
-def _best_effort_remove(path: Path) -> None:
+@dataclass(frozen=True)
+class _FileSnapshot:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+
+
+def _snapshot(file_stat: os.stat_result) -> _FileSnapshot:
+    return _FileSnapshot(
+        device=file_stat.st_dev,
+        inode=file_stat.st_ino,
+        size=file_stat.st_size,
+        modified_ns=file_stat.st_mtime_ns,
+    )
+
+
+def _same_file(left: _FileSnapshot, right: _FileSnapshot) -> bool:
+    return left.device == right.device and left.inode == right.inode
+
+
+def _directory_open_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _regular_file_open_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+
+
+def _stat_at(directory_fd: int, name: str) -> os.stat_result | None:
     try:
-        path.unlink(missing_ok=True)
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _validate_directory_components(path: Path) -> None:
+    absolute_path = Path(os.path.abspath(path))
+    current = Path(absolute_path.anchor)
+    for component in absolute_path.parts[1:]:
+        current /= component
+        component_stat = current.lstat()
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ValueError(f"unsafe model patch path component: {current}")
+
+
+def _open_safe_directory(path: Path) -> int:
+    _validate_directory_components(path)
+    before = path.lstat()
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError(f"unsafe model patch directory: {path}")
+    directory_fd = os.open(path, _directory_open_flags())
+    try:
+        opened = os.fstat(directory_fd)
+        after = path.lstat()
+        if not stat.S_ISDIR(opened.st_mode) or not stat.S_ISDIR(after.st_mode):
+            raise ValueError(f"unsafe model patch directory: {path}")
+        if not _same_file(_snapshot(opened), _snapshot(after)):
+            raise ValueError(f"model patch directory changed while opening: {path}")
+        return directory_fd
+    except Exception:
+        try:
+            os.close(directory_fd)
+        except Exception:
+            pass
+        raise
+
+
+def _revalidate_directory(path: Path, directory_fd: int) -> None:
+    current = path.lstat()
+    opened = os.fstat(directory_fd)
+    if not stat.S_ISDIR(current.st_mode) or not stat.S_ISDIR(opened.st_mode):
+        raise ValueError(f"unsafe model patch directory: {path}")
+    if not _same_file(_snapshot(current), _snapshot(opened)):
+        raise ValueError(f"model patch directory changed: {path}")
+
+
+def _open_or_create_child_directory(
+    parent_fd: int, parent_path: Path, name: str
+) -> tuple[int, Path]:
+    if not _safe_path(name, "") or Path(name).name != name:
+        raise ValueError("unsafe model patch directory name")
+    _revalidate_directory(parent_path, parent_fd)
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    child_stat = _stat_at(parent_fd, name)
+    if child_stat is None or not stat.S_ISDIR(child_stat.st_mode):
+        raise ValueError(f"unsafe model patch directory component: {name}")
+    child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    try:
+        opened = os.fstat(child_fd)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_file(
+            _snapshot(child_stat), _snapshot(opened)
+        ):
+            raise ValueError(f"model patch directory component changed: {name}")
+        return child_fd, parent_path / name
+    except Exception:
+        try:
+            os.close(child_fd)
+        except Exception:
+            pass
+        raise
+
+
+def _require_missing_at(directory_fd: int, name: str) -> None:
+    if _stat_at(directory_fd, name) is not None:
+        raise ValueError(f"unsafe pre-existing model patch output: {name}")
+
+
+def _read_regular_file_at(directory_fd: int, name: str) -> tuple[bytes, _FileSnapshot]:
+    before = _stat_at(directory_fd, name)
+    if before is None or not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"model patch input must be a regular file: {name}")
+    file_fd = os.open(name, _regular_file_open_flags(), dir_fd=directory_fd)
+    try:
+        opened = os.fstat(file_fd)
+        if not stat.S_ISREG(opened.st_mode) or not _same_file(
+            _snapshot(before), _snapshot(opened)
+        ):
+            raise ValueError(f"model patch input changed while opening: {name}")
+        source = os.fdopen(file_fd, "rb", closefd=True)
+        file_fd = -1
+        with source:
+            content = source.read()
+    finally:
+        if file_fd >= 0:
+            try:
+                os.close(file_fd)
+            except Exception:
+                pass
+    after = _stat_at(directory_fd, name)
+    if after is None or _snapshot(after) != _snapshot(before):
+        raise ValueError(f"model patch input changed while reading: {name}")
+    return content, _snapshot(before)
+
+
+def _create_secure_temp_file(
+    directory_fd: int, prefix: str, content: bytes
+) -> tuple[str, _FileSnapshot]:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    for _ in range(64):
+        name = f"{prefix}{secrets.token_hex(16)}.tmp"
+        try:
+            file_fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        except FileExistsError:
+            continue
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(file_fd, view)
+                if written <= 0:
+                    raise OSError("failed to write model patch temporary file")
+                view = view[written:]
+            os.fsync(file_fd)
+            file_stat = os.fstat(file_fd)
+            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size != len(content):
+                raise ValueError("model patch temporary output is not a regular file")
+            return name, _snapshot(file_stat)
+        except Exception:
+            _best_effort_unlink_at(directory_fd, name)
+            raise
+        finally:
+            try:
+                os.close(file_fd)
+            except Exception:
+                pass
+    raise FileExistsError("could not allocate a unique model patch temporary file")
+
+
+def _best_effort_unlink_at(
+    directory_fd: int | None,
+    name: str | None,
+    expected: _FileSnapshot | None = None,
+) -> None:
+    if directory_fd is None or name is None:
+        return
+    try:
+        current = _stat_at(directory_fd, name)
+        if current is None:
+            return
+        if expected is not None and _snapshot(current) != expected:
+            return
+        os.unlink(name, dir_fd=directory_fd)
+    except Exception:
+        pass
+
+
+def _best_effort_close(file_fd: int | None) -> None:
+    if file_fd is None:
+        return
+    try:
+        os.close(file_fd)
     except Exception:
         pass
 
@@ -397,8 +596,10 @@ def _has_unredacted_secret(text: str) -> bool:
     return False
 
 
-def _write_reference(trajectory_path: Path, reference: dict[str, str | int]) -> None:
-    trajectory = json.loads(trajectory_path.read_text())
+def _trajectory_with_reference(
+    content: bytes, reference: dict[str, str | int]
+) -> bytes:
+    trajectory = json.loads(content.decode("utf-8"))
     extra = trajectory.setdefault("extra", {})
     if not isinstance(extra, dict):
         raise ValueError("ATIF extra must be an object")
@@ -406,11 +607,7 @@ def _write_reference(trajectory_path: Path, reference: dict[str, str | int]) -> 
     if not isinstance(vals_extra, dict):
         raise ValueError("ATIF extra.vals must be an object")
     vals_extra["model_patch"] = reference
-    temporary_path = trajectory_path.with_suffix(".json.tmp")
-    temporary_path.write_text(
-        json.dumps(trajectory, indent=2, ensure_ascii=False) + "\n"
-    )
-    temporary_path.replace(trajectory_path)
+    return (json.dumps(trajectory, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def write_model_patch(
@@ -420,9 +617,11 @@ def write_model_patch(
     baseline: ModelPatchBaseline,
 ) -> bool:
     """Write an optional validated model patch and attach its ATIF reference."""
-    patch_path = logs_dir / "artifacts/model.patch"
-    patch_temp_path = logs_dir / "artifacts/.model.patch.tmp"
-    reference_temp_path = trajectory_path.with_suffix(".json.tmp")
+    logs_fd: int | None = None
+    artifacts_fd: int | None = None
+    patch_temp_name: str | None = None
+    trajectory_temp_name: str | None = None
+    published_patch: _FileSnapshot | None = None
     try:
         if not _COMMIT_RE.fullmatch(baseline.base_commit) or not _COMMIT_RE.fullmatch(
             baseline.tree
@@ -476,27 +675,116 @@ def write_model_patch(
         if _has_unredacted_secret(text):
             raise ValueError("model patch contains a potential unredacted secret")
 
-        patch_path.parent.mkdir(parents=True, exist_ok=True)
-        patch_temp_path.write_bytes(patch)
-        patch_temp_path.replace(patch_path)
-        _write_reference(
-            trajectory_path,
-            {
-                "path": "artifacts/model.patch",
-                "media_type": "text/x-diff",
-                "sha256": hashlib.sha256(patch).hexdigest(),
-                "base_commit": baseline.base_commit,
-                "file_count": file_count,
-                "additions": additions,
-                "deletions": deletions,
-            },
+        absolute_logs_dir = Path(os.path.abspath(logs_dir))
+        absolute_trajectory_path = Path(os.path.abspath(trajectory_path))
+        if absolute_trajectory_path.parent != absolute_logs_dir or not _safe_path(
+            trajectory_path.name, ""
+        ):
+            raise ValueError(
+                "trajectory path must be a direct child of the logs directory"
+            )
+
+        logs_fd = _open_safe_directory(logs_dir)
+        trajectory_name = trajectory_path.name
+        legacy_reference_temp_name = trajectory_path.with_suffix(".json.tmp").name
+        _require_missing_at(logs_fd, legacy_reference_temp_name)
+        trajectory_content, original_trajectory = _read_regular_file_at(
+            logs_fd, trajectory_name
         )
+        reference = {
+            "path": "artifacts/model.patch",
+            "media_type": "text/x-diff",
+            "sha256": hashlib.sha256(patch).hexdigest(),
+            "base_commit": baseline.base_commit,
+            "file_count": file_count,
+            "additions": additions,
+            "deletions": deletions,
+        }
+        updated_trajectory = _trajectory_with_reference(trajectory_content, reference)
+
+        artifacts_fd, artifacts_path = _open_or_create_child_directory(
+            logs_fd, logs_dir, "artifacts"
+        )
+        _require_missing_at(artifacts_fd, ".model.patch.tmp")
+        _require_missing_at(artifacts_fd, "model.patch")
+        patch_temp_name, patch_temp = _create_secure_temp_file(
+            artifacts_fd, ".model.patch.", patch
+        )
+        trajectory_temp_name, trajectory_temp = _create_secure_temp_file(
+            logs_fd,
+            f".{trajectory_name}.",
+            updated_trajectory,
+        )
+
+        _revalidate_directory(logs_dir, logs_fd)
+        _revalidate_directory(artifacts_path, artifacts_fd)
+        _require_missing_at(logs_fd, legacy_reference_temp_name)
+        _require_missing_at(artifacts_fd, ".model.patch.tmp")
+        _require_missing_at(artifacts_fd, "model.patch")
+        current_trajectory = _stat_at(logs_fd, trajectory_name)
+        current_patch_temp = _stat_at(artifacts_fd, patch_temp_name)
+        if (
+            current_trajectory is None
+            or _snapshot(current_trajectory) != original_trajectory
+        ):
+            raise ValueError("trajectory changed during model patch collection")
+        if (
+            current_patch_temp is None
+            or not stat.S_ISREG(current_patch_temp.st_mode)
+            or _snapshot(current_patch_temp) != patch_temp
+        ):
+            raise ValueError("model patch temporary file changed during collection")
+
+        os.replace(
+            patch_temp_name,
+            "model.patch",
+            src_dir_fd=artifacts_fd,
+            dst_dir_fd=artifacts_fd,
+        )
+        patch_temp_name = None
+        final_patch = _stat_at(artifacts_fd, "model.patch")
+        if final_patch is None or not stat.S_ISREG(final_patch.st_mode):
+            raise ValueError("final model patch artifact is not a regular file")
+        published_patch = _snapshot(final_patch)
+        if published_patch != patch_temp:
+            raise ValueError("model patch artifact changed during publication")
+
+        _revalidate_directory(logs_dir, logs_fd)
+        _revalidate_directory(artifacts_path, artifacts_fd)
+        current_patch = _stat_at(artifacts_fd, "model.patch")
+        current_trajectory = _stat_at(logs_fd, trajectory_name)
+        current_trajectory_temp = _stat_at(logs_fd, trajectory_temp_name)
+        if current_patch is None or _snapshot(current_patch) != published_patch:
+            raise ValueError(
+                "model patch artifact changed before trajectory publication"
+            )
+        if (
+            current_trajectory is None
+            or _snapshot(current_trajectory) != original_trajectory
+        ):
+            raise ValueError("trajectory changed before model patch publication")
+        if (
+            current_trajectory_temp is None
+            or not stat.S_ISREG(current_trajectory_temp.st_mode)
+            or _snapshot(current_trajectory_temp) != trajectory_temp
+        ):
+            raise ValueError("trajectory temporary file changed during publication")
+        os.replace(
+            trajectory_temp_name,
+            trajectory_name,
+            src_dir_fd=logs_fd,
+            dst_dir_fd=logs_fd,
+        )
+        trajectory_temp_name = None
         return True
     except Exception as error:
-        _best_effort_remove(patch_path)
-        _best_effort_remove(patch_temp_path)
-        _best_effort_remove(reference_temp_path)
+        _best_effort_unlink_at(artifacts_fd, patch_temp_name)
+        _best_effort_unlink_at(logs_fd, trajectory_temp_name)
+        if published_patch is not None:
+            _best_effort_unlink_at(artifacts_fd, "model.patch", published_patch)
         logging.getLogger(__name__).warning("Model patch omitted: %s", error)
         return False
     finally:
+        _best_effort_close(artifacts_fd)
+        _best_effort_close(logs_fd)
         cleanup_model_patch_baseline(baseline)

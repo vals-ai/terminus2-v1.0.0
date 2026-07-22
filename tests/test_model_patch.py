@@ -136,6 +136,12 @@ def test_writes_text_patch_and_atif_reference(tmp_path: Path) -> None:
     }
     assert _object_inventory(repo) == objects_before
     assert not state_dir.exists()
+    assert (logs_dir / "artifacts/model.patch").is_file()
+    assert not (logs_dir / "artifacts/model.patch").is_symlink()
+    assert trajectory_path.is_file()
+    assert not trajectory_path.is_symlink()
+    assert not list(logs_dir.glob(".*.tmp"))
+    assert not list((logs_dir / "artifacts").glob(".*.tmp"))
 
 
 def test_diffs_preexisting_untracked_file_from_its_pre_model_content(
@@ -507,6 +513,188 @@ def test_collection_cleanup_failure_is_fail_open(
     assert blocked_path.is_dir()
     assert trajectory_path.read_text() == original
     assert _object_inventory(repo) == objects_before
+    assert not state_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "legacy_temp_path",
+    [
+        "artifacts/.model.patch.tmp",
+        "trajectory.json.tmp",
+    ],
+)
+def test_rejects_legacy_temp_symlink_without_touching_sentinel(
+    tmp_path: Path,
+    legacy_temp_path: str,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text("value = 2\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original_trajectory = trajectory_path.read_text()
+    sentinel = tmp_path / "scored-output.txt"
+    sentinel.write_text("scored output\n")
+    legacy_path = logs_dir / legacy_temp_path
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.symlink_to(sentinel)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert sentinel.read_text() == "scored output\n"
+    assert legacy_path.is_symlink()
+    assert trajectory_path.read_text() == original_trajectory
+    assert not (logs_dir / "artifacts/model.patch").exists()
+
+
+def test_rejects_final_patch_symlink_without_touching_sentinel(tmp_path: Path) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text("value = 2\n")
+    logs_dir = tmp_path / "logs"
+    artifacts_dir = logs_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original_trajectory = trajectory_path.read_text()
+    sentinel = tmp_path / "scored-output.txt"
+    sentinel.write_text("scored output\n")
+    patch_path = artifacts_dir / "model.patch"
+    patch_path.symlink_to(sentinel)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert sentinel.read_text() == "scored output\n"
+    assert patch_path.is_symlink()
+    assert trajectory_path.read_text() == original_trajectory
+
+
+def test_rejects_trajectory_symlink_without_touching_scored_file(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text("value = 2\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    scored_trajectory = tmp_path / "scored-trajectory.json"
+    _trajectory(scored_trajectory)
+    original_scored_trajectory = scored_trajectory.read_text()
+    trajectory_path = logs_dir / "trajectory.json"
+    trajectory_path.symlink_to(scored_trajectory)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert scored_trajectory.read_text() == original_scored_trajectory
+    assert trajectory_path.is_symlink()
+    assert not (logs_dir / "artifacts/model.patch").exists()
+
+
+def test_rejects_symlinked_artifacts_parent_without_writing_outside_logs(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text("value = 2\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original_trajectory = trajectory_path.read_text()
+    outside_dir = tmp_path / "scored-directory"
+    outside_dir.mkdir()
+    sentinel = outside_dir / "scored-output.txt"
+    sentinel.write_text("scored output\n")
+    (logs_dir / "artifacts").symlink_to(outside_dir, target_is_directory=True)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert sentinel.read_text() == "scored output\n"
+    assert not (outside_dir / "model.patch").exists()
+    assert trajectory_path.read_text() == original_trajectory
+
+
+def test_rejects_symlinked_logs_directory_without_touching_scored_files(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text("value = 2\n")
+    real_logs = tmp_path / "scored-logs"
+    real_logs.mkdir()
+    scored_trajectory = real_logs / "trajectory.json"
+    _trajectory(scored_trajectory)
+    original_scored_trajectory = scored_trajectory.read_text()
+    logs_dir = tmp_path / "logs-link"
+    logs_dir.symlink_to(real_logs, target_is_directory=True)
+    trajectory_path = logs_dir / "trajectory.json"
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert scored_trajectory.read_text() == original_scored_trajectory
+    assert not (real_logs / "artifacts/model.patch").exists()
+
+
+def test_rejects_symlinked_logs_parent_component_without_touching_scored_files(
+    tmp_path: Path,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text("value = 2\n")
+    real_parent = tmp_path / "scored-parent"
+    real_logs = real_parent / "logs"
+    real_logs.mkdir(parents=True)
+    scored_trajectory = real_logs / "trajectory.json"
+    _trajectory(scored_trajectory)
+    original_scored_trajectory = scored_trajectory.read_text()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    logs_dir = linked_parent / "logs"
+    trajectory_path = logs_dir / "trajectory.json"
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert scored_trajectory.read_text() == original_scored_trajectory
+    assert not (real_logs / "artifacts/model.patch").exists()
+
+
+def test_unique_temp_cleanup_failure_never_escapes_or_mutates_trajectory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    assert baseline.state_dir is not None
+    state_dir = Path(baseline.state_dir)
+    (repo / "example.py").write_text("value = 2\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+    original_trajectory = trajectory_path.read_text()
+
+    monkeypatch.setattr(
+        model_patch_module.os,
+        "replace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            PermissionError("replace denied")
+        ),
+    )
+    monkeypatch.setattr(
+        model_patch_module.os,
+        "unlink",
+        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("unlink denied")),
+    )
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert trajectory_path.read_text() == original_trajectory
+    assert not (logs_dir / "artifacts/model.patch").exists()
+
+    monkeypatch.undo()
+    model_patch_module.cleanup_model_patch_baseline(baseline)
     assert not state_dir.exists()
 
 
