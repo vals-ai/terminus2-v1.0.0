@@ -1,9 +1,16 @@
+import json
+import logging
+from pathlib import Path
+
 from model_library.base import QueryResultMetadata
 
 from terminus2.agent.context import AgentContext
+from terminus2.trajectories.agent import Agent
 from terminus2.trajectories.final_metrics import FinalMetrics
 from terminus2.trajectories.metrics import Metrics
+from terminus2.trajectories.step import Step
 from terminus2.trajectories.trajectory import Trajectory
+from terminus2.terminus_2 import Terminus2, _model_routing
 
 
 def test_trajectory_defaults_to_atif_v17() -> None:
@@ -127,3 +134,88 @@ def test_agent_context_preserves_unknown_optional_aggregate_counts() -> None:
         "total_completion_tokens": 7,
         "total_steps": 2,
     }
+
+
+def test_model_routing_records_confirmed_fallback() -> None:
+    metadata = QueryResultMetadata(
+        in_tokens=1,
+        out_tokens=1,
+        extra={
+            "anthropic_response_model": "claude-opus-4-8",
+            "fallback": True,
+        },
+    )
+
+    assert _model_routing(metadata, "anthropic/claude-sonnet-4-6") == (
+        "anthropic/claude-opus-4-8",
+        {
+            "vals": {
+                "model_routing": {
+                    "requested_model": "anthropic/claude-sonnet-4-6",
+                    "resolved_model": "anthropic/claude-opus-4-8",
+                    "fallback_used": True,
+                }
+            }
+        },
+    )
+
+
+def _terminus_for_trajectory_test(tmp_path: Path) -> Terminus2:
+    terminus = Terminus2.__new__(Terminus2)
+    terminus.logs_dir = tmp_path
+    terminus._logger = logging.getLogger(__name__)
+    terminus._model_name = "anthropic/claude-sonnet-4-6"
+    terminus._parser_name = "json"
+    terminus._temperature = None
+    terminus._session_id = "run-1-cont-1"
+    terminus._summarization_count = 1
+    terminus._linear_history = True
+    terminus._subagent_trajectories = []
+    return terminus
+
+
+def test_subagent_reference_resolves_to_embedded_trajectory(tmp_path: Path) -> None:
+    terminus = _terminus_for_trajectory_test(tmp_path)
+    metadata = QueryResultMetadata(in_tokens=2, out_tokens=1)
+    steps = [Step(step_id=1, source="user", message="Summarize")]
+
+    reference = terminus._save_subagent_trajectory(
+        session_id="run-1-summary",
+        agent_name="terminus-2-summarization-summary",
+        steps=steps,
+        result_metadata=metadata,
+        filename_suffix="summary",
+        summary_text="Summary generation",
+    )
+
+    assert reference.trajectory_id == "summarization-1-summary"
+    assert reference.trajectory_path is None
+    assert terminus._subagent_trajectories[0].trajectory_id == reference.trajectory_id
+
+
+def test_final_linear_trajectory_is_also_written_as_self_contained_root(
+    tmp_path: Path,
+) -> None:
+    terminus = _terminus_for_trajectory_test(tmp_path)
+    context = AgentContext()
+    context.accumulate(QueryResultMetadata(in_tokens=2, out_tokens=1))
+    terminus._context = context
+    terminus._trajectory_steps = [Step(step_id=1, source="user", message="Continue")]
+    terminus._subagent_trajectories = [
+        Trajectory(
+            trajectory_id="summarization-1-summary",
+            session_id="run-1-summary",
+            agent=Agent(name="summary", version="1", model_name=terminus._model_name),
+            steps=[Step(step_id=1, source="user", message="Summarize")],
+        )
+    ]
+
+    terminus._dump_trajectory()
+
+    assert (tmp_path / "trajectory.cont-1.json").is_file()
+    canonical = json.loads((tmp_path / "trajectory.json").read_text())
+    assert "continued_trajectory_ref" not in canonical
+    assert (
+        canonical["subagent_trajectories"][0]["trajectory_id"]
+        == "summarization-1-summary"
+    )

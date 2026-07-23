@@ -29,6 +29,10 @@ class Trajectory(BaseModel):
         default=...,
         description="Unique identifier for the entire agent run",
     )
+    trajectory_id: str | None = Field(
+        default=None,
+        description="Identifier for this trajectory document",
+    )
     agent: Agent = Field(
         default=...,
         description="Object specifying the agent configuration",
@@ -49,6 +53,10 @@ class Trajectory(BaseModel):
     continued_trajectory_ref: str | None = Field(
         default=None,
         description="Reference to the continuation trajectory file if this trajectory is continued in another file",
+    )
+    subagent_trajectories: list["Trajectory"] | None = Field(
+        default=None,
+        description="Subagent trajectories embedded in this document",
     )
     extra: dict[str, Any] | None = Field(
         default=None,

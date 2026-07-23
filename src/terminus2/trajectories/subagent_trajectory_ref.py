@@ -12,6 +12,10 @@ class SubagentTrajectoryRef(BaseModel):
         default=...,
         description="The session ID of the delegated subagent trajectory",
     )
+    trajectory_id: str | None = Field(
+        default=None,
+        description="Identifier of an embedded subagent trajectory",
+    )
     trajectory_path: str | None = Field(
         default=None,
         description="Reference to the complete subagent trajectory file",

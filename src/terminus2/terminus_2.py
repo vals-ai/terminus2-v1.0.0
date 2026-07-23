@@ -46,10 +46,44 @@ from terminus2.utils.logger import logger
 from terminus2.utils.trajectory_utils import format_trajectory_json
 
 
+def _model_routing(
+    metadata: QueryResultMetadata, requested_model: str
+) -> tuple[str, dict[str, object] | None]:
+    response_model = metadata.extra.get("anthropic_response_model")
+    if not isinstance(response_model, str) or not response_model:
+        return requested_model, None
+    resolved_model = (
+        response_model if "/" in response_model else f"anthropic/{response_model}"
+    )
+    if metadata.extra.get("fallback") is not True:
+        return resolved_model, None
+    return resolved_model, {
+        "vals": {
+            "model_routing": {
+                "requested_model": requested_model,
+                "resolved_model": resolved_model,
+                "fallback_used": True,
+            }
+        }
+    }
+
+
 @dataclass
 class Command:
     keystrokes: str
     duration_sec: float
+
+
+def _terminal_observation_source_call_id(
+    commands: list[Command], episode: int, *, is_task_complete: bool = False
+) -> str | None:
+    if commands and is_task_complete:
+        return None
+    if len(commands) == 1:
+        return f"call_{episode}_1"
+    if not commands and is_task_complete:
+        return f"call_{episode}_task_complete"
+    return None
 
 
 class Terminus2(BaseAgent):
@@ -197,6 +231,7 @@ class Terminus2(BaseAgent):
         self._pending_subagent_refs: list[SubagentTrajectoryRef] | None = (
             None  # Track subagent refs to include in next step
         )
+        self._subagent_trajectories: list[Trajectory] = []
         self._pending_handoff_prompt: str | None = None  # Track handoff prompt to include as user step
         self._enable_summarize = enable_summarize  # Toggle for proactive and context limit summarization
         self._proactive_summarization_threshold = proactive_summarization_threshold
@@ -555,16 +590,22 @@ so ask everything you need to know."""
         )
         step_id_counter += 1
 
+        summary_model, summary_extra = _model_routing(
+            summary_result.metadata, self._model_name
+        )
         answers_steps.append(
             Step(
                 step_id=step_id_counter,
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 source="agent",
-                model_name=self._model_name,
+                model_name=summary_model,
                 message=summary_result.output_text,
                 reasoning_content=summary_result.reasoning,
                 is_copied_context=True,
-                extra={"note": "Copied from summary subagent - metrics already recorded there"},
+                extra={
+                    **(summary_extra or {}),
+                    "note": "Copied from summary subagent - metrics already recorded there",
+                },
             )
         )
         step_id_counter += 1
@@ -944,12 +985,13 @@ so ask everything you need to know."""
                 # For error cases, we still want to record the step
                 # Use the raw response as the message since parsing failed
                 metadata = query_result.metadata
+                step_model, step_extra = _model_routing(metadata, self._model_name)
                 self._trajectory_steps.append(
                     Step(
                         step_id=len(self._trajectory_steps) + 1,
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         source="agent",
-                        model_name=self._model_name,
+                        model_name=step_model,
                         message=message_content,
                         reasoning_content=query_result.reasoning,
                         observation=Observation(
@@ -960,6 +1002,7 @@ so ask everything you need to know."""
                             ]
                         ),
                         metrics=Metrics.from_query_result_metadata(metadata),
+                        extra=step_extra,
                     )
                 )
                 continue
@@ -1016,11 +1059,15 @@ so ask everything you need to know."""
                             )
                         )
 
-                    # Add observation result after all tool calls are created
-                    # Note: All commands share the same terminal output in this architecture,
-                    # so we omit source_call_id to indicate the observation applies to the entire step.
+                    # Multi-command batches share one terminal output, so only
+                    # single-command observations can be linked precisely.
                     observation_results.append(
                         ObservationResult(
+                            source_call_id=_terminal_observation_source_call_id(
+                                commands,
+                                episode,
+                                is_task_complete=is_task_complete,
+                            ),
                             content=observation,
                         )
                     )
@@ -1039,6 +1086,11 @@ so ask everything you need to know."""
                     if not commands:
                         observation_results.append(
                             ObservationResult(
+                                source_call_id=_terminal_observation_source_call_id(
+                                    commands,
+                                    episode,
+                                    is_task_complete=True,
+                                ),
                                 content=observation,
                             )
                         )
@@ -1060,17 +1112,19 @@ so ask everything you need to know."""
                 )
 
             # Build the step object using Pydantic models
+            step_model, step_extra = _model_routing(metadata, self._model_name)
             self._trajectory_steps.append(
                 Step(
                     step_id=len(self._trajectory_steps) + 1,
                     timestamp=datetime.now(timezone.utc).isoformat(),
                     source="agent",
-                    model_name=self._model_name,
+                    model_name=step_model,
                     message=message_content,
                     reasoning_content=query_result.reasoning,
                     tool_calls=tool_calls,
                     observation=Observation(results=observation_results),
                     metrics=Metrics.from_query_result_metadata(metadata),
+                    extra=step_extra,
                 )
             )
 
@@ -1187,15 +1241,17 @@ so ask everything you need to know."""
         """
         metadata = query_result.metadata
         if metadata:
+            step_model, step_extra = _model_routing(metadata, self._model_name)
             steps.append(
                 Step(
                     step_id=step_id,
                     timestamp=datetime.now(timezone.utc).isoformat(),
                     source="agent",
-                    model_name=self._model_name,
+                    model_name=step_model,
                     message=query_result.output_text,
                     reasoning_content=query_result.reasoning,
                     metrics=Metrics.from_query_result_metadata(metadata),
+                    extra=step_extra,
                 )
             )
         else:
@@ -1234,8 +1290,10 @@ so ask everything you need to know."""
             SubagentTrajectoryRef for inclusion in parent trajectory
         """
 
+        trajectory_id = f"summarization-{self._summarization_count}-{filename_suffix}"
         trajectory = Trajectory(
             session_id=session_id,
+            trajectory_id=trajectory_id,
             agent=Agent(
                 name=agent_name,
                 version=self.version() or "unknown",
@@ -1265,9 +1323,10 @@ so ask everything you need to know."""
         except Exception as save_error:
             self._logger.error(f"Failed to save {filename_suffix} subagent trajectory: {save_error}")
 
+        self._subagent_trajectories.append(trajectory)
         return SubagentTrajectoryRef(
             session_id=session_id,
-            trajectory_path=str(trajectory_path.name),
+            trajectory_id=trajectory_id,
             extra={"summary": summary_text},
         )
 
@@ -1354,7 +1413,9 @@ so ask everything you need to know."""
         if self._chat:
             self._trajectory_steps = self._convert_chat_messages_to_steps(self._chat.messages[:-1], mark_as_copied=True)
 
-    def _dump_trajectory_with_continuation_index(self, continuation_index: int) -> None:
+    def _dump_trajectory_with_continuation_index(
+        self, continuation_index: int, *, write_canonical: bool = False
+    ) -> None:
         """Dump trajectory data to JSON file with specified continuation index.
 
         Args:
@@ -1405,6 +1466,7 @@ so ask everything you need to know."""
             steps=self._trajectory_steps,
             final_metrics=final_metrics,
             continued_trajectory_ref=continued_trajectory_ref,
+            subagent_trajectories=self._subagent_trajectories or None,
         )
 
         # Determine trajectory filename based on continuation index
@@ -1417,13 +1479,16 @@ so ask everything you need to know."""
             with open(trajectory_path, "w") as f:
                 json_str = format_trajectory_json(trajectory.to_json_dict())
                 f.write(json_str)
+            if write_canonical and trajectory_path.name != "trajectory.json":
+                with open(self.logs_dir / "trajectory.json", "w") as f:
+                    f.write(json_str)
             self._logger.debug(f"Trajectory dumped to {trajectory_path}")
         except Exception as e:
             self._logger.error(f"Failed to dump trajectory: {e}")
 
     def _dump_trajectory(self) -> None:
         """Dump trajectory data to JSON file following ATIF format."""
-        self._dump_trajectory_with_continuation_index(self._summarization_count)
+        self._dump_trajectory_with_continuation_index(self._summarization_count, write_canonical=True)
 
     # TODO: Add asciinema logging
     def _record_asciinema_marker(self, marker_text: str) -> None:
