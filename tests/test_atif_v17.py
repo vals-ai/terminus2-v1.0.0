@@ -1,6 +1,7 @@
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 from model_library.base import QueryResultMetadata
 
@@ -8,7 +9,10 @@ from terminus2.agent.context import AgentContext
 from terminus2.trajectories.agent import Agent
 from terminus2.trajectories.final_metrics import FinalMetrics
 from terminus2.trajectories.metrics import Metrics
+from terminus2.trajectories.observation import Observation
+from terminus2.trajectories.observation_result import ObservationResult
 from terminus2.trajectories.step import Step
+from terminus2.trajectories.tool_call import ToolCall
 from terminus2.trajectories.trajectory import Trajectory
 from terminus2.terminus_2 import Terminus2, _model_routing
 
@@ -171,6 +175,7 @@ def _terminus_for_trajectory_test(tmp_path: Path) -> Terminus2:
     terminus._summarization_count = 1
     terminus._linear_history = True
     terminus._subagent_trajectories = []
+    terminus._completed_trajectory_steps = []
     return terminus
 
 
@@ -200,7 +205,40 @@ def test_final_linear_trajectory_is_also_written_as_self_contained_root(
     context = AgentContext()
     context.accumulate(QueryResultMetadata(in_tokens=2, out_tokens=1))
     terminus._context = context
-    terminus._trajectory_steps = [Step(step_id=1, source="user", message="Continue")]
+    terminus._completed_trajectory_steps = [
+        Step(
+            step_id=1,
+            timestamp="2026-07-21T01:00:00Z",
+            source="agent",
+            model_name=terminus._model_name,
+            message="Inspecting",
+            tool_calls=[
+                ToolCall(
+                    tool_call_id="call-1",
+                    function_name="terminal",
+                    arguments={"command": "ls"},
+                )
+            ],
+            observation=Observation(
+                results=[
+                    ObservationResult(
+                        source_call_id="call-1",
+                        content="README.md",
+                    )
+                ]
+            ),
+            metrics=Metrics(prompt_tokens=2, completion_tokens=1),
+        )
+    ]
+    terminus._trajectory_steps = [
+        Step(
+            step_id=1,
+            source="user",
+            message="Copied context",
+            is_copied_context=True,
+        ),
+        Step(step_id=2, source="user", message="Continue"),
+    ]
     terminus._subagent_trajectories = [
         Trajectory(
             trajectory_id="summarization-1-summary",
@@ -215,7 +253,67 @@ def test_final_linear_trajectory_is_also_written_as_self_contained_root(
     assert (tmp_path / "trajectory.cont-1.json").is_file()
     canonical = json.loads((tmp_path / "trajectory.json").read_text())
     assert "continued_trajectory_ref" not in canonical
+    assert [step["message"] for step in canonical["steps"]] == [
+        "Inspecting",
+        "Continue",
+    ]
+    assert canonical["steps"][0]["metrics"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+    }
+    assert canonical["steps"][0]["tool_calls"][0]["tool_call_id"] == "call-1"
+    assert canonical["steps"][0]["observation"]["results"][0]["content"] == "README.md"
     assert (
         canonical["subagent_trajectories"][0]["trajectory_id"]
         == "summarization-1-summary"
     )
+
+
+def test_linear_split_retains_structured_steps_for_canonical_root(
+    tmp_path: Path,
+) -> None:
+    terminus = _terminus_for_trajectory_test(tmp_path)
+    terminus._context = AgentContext()
+    terminus._trajectory_steps = [
+        Step(
+            step_id=1,
+            timestamp="2026-07-21T01:00:00Z",
+            source="agent",
+            model_name=terminus._model_name,
+            message="Inspecting",
+            metrics=Metrics(prompt_tokens=2, completion_tokens=1),
+        )
+    ]
+    terminus._chat = SimpleNamespace(
+        messages=[
+            {"role": "user", "content": "Original task"},
+            {"role": "user", "content": "Continue from the summary"},
+            {"role": "assistant", "content": "I will continue"},
+        ]
+    )
+
+    terminus._split_trajectory_on_summarization("Continue from the summary")
+
+    assert terminus._completed_trajectory_steps[0].metrics is not None
+    assert terminus._completed_trajectory_steps[0].timestamp == "2026-07-21T01:00:00Z"
+    assert [step.message for step in terminus._trajectory_steps] == [
+        "Original task",
+        "Continue from the summary",
+    ]
+    assert terminus._trajectory_steps[0].is_copied_context is True
+    assert terminus._trajectory_steps[1].is_copied_context is not True
+    assert terminus._trajectory_steps[1].timestamp is not None
+
+    terminus._trajectory_steps.append(
+        Step(
+            step_id=3,
+            source="agent",
+            model_name=terminus._model_name,
+            message="I will continue",
+        )
+    )
+    terminus._dump_trajectory()
+    canonical = json.loads((tmp_path / "trajectory.json").read_text())
+    assert [step["message"] for step in canonical["steps"]].count(
+        "Continue from the summary"
+    ) == 1

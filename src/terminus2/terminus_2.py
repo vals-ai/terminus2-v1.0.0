@@ -226,6 +226,7 @@ class Terminus2(BaseAgent):
         self._n_episodes: int = 0
         self._session_id = session_id if session_id else str(uuid.uuid4())
         self._trajectory_steps: list[Step] = []
+        self._completed_trajectory_steps: list[Step] = []
 
         self._summarization_count: int = 0  # Track number of summarization subagents created
         self._pending_subagent_refs: list[SubagentTrajectoryRef] | None = (
@@ -1383,6 +1384,7 @@ so ask everything you need to know."""
             steps.append(
                 Step(
                     step_id=step_id,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
                     source="user",
                     message=additional_user_message,
                 )
@@ -1402,6 +1404,11 @@ so ask everything you need to know."""
         # When _summarization_count is 1, dump to trajectory.json (continuation_index = 0)
         # When _summarization_count is 2, dump to trajectory.cont-1.json (continuation_index = 1)
         self._dump_trajectory_with_continuation_index(self._summarization_count - 1)
+        self._completed_trajectory_steps.extend(
+            copy.deepcopy(step)
+            for step in self._trajectory_steps
+            if not step.is_copied_context
+        )
 
         # Create new session_id for continuation
         self._session_id = f"{self._session_id.split('-cont-')[0]}-cont-{self._summarization_count}"
@@ -1411,7 +1418,11 @@ so ask everything you need to know."""
         # by the normal agent loop flow). Mark all these steps as copied context since they
         # were already present in the previous trajectory segment.
         if self._chat:
-            self._trajectory_steps = self._convert_chat_messages_to_steps(self._chat.messages[:-1], mark_as_copied=True)
+            self._trajectory_steps = self._convert_chat_messages_to_steps(
+                self._chat.messages[:-2],
+                additional_user_message=handoff_prompt,
+                mark_as_copied=True,
+            )
 
     def _dump_trajectory_with_continuation_index(
         self, continuation_index: int, *, write_canonical: bool = False
@@ -1480,8 +1491,42 @@ so ask everything you need to know."""
                 json_str = format_trajectory_json(trajectory.to_json_dict())
                 f.write(json_str)
             if write_canonical and trajectory_path.name != "trajectory.json":
+                canonical_steps = [
+                    copy.deepcopy(step)
+                    for step in (
+                        self._completed_trajectory_steps
+                        + [step for step in self._trajectory_steps if not step.is_copied_context]
+                    )
+                ]
+                for step_id, step in enumerate(canonical_steps, start=1):
+                    step.step_id = step_id
+                canonical_metrics = FinalMetrics.from_token_counts(
+                    input_tokens=self._context.n_input_tokens,
+                    output_tokens=self._context.n_output_tokens,
+                    reasoning_tokens=optional_token_totals["reasoning_tokens"],
+                    cache_read_tokens=optional_token_totals["cache_read_tokens"],
+                    cache_write_tokens=optional_token_totals["cache_write_tokens"],
+                    cost_usd=self._context.optional_cost_total(),
+                    total_steps=len(canonical_steps),
+                )
+                canonical = Trajectory(
+                    trajectory_id="root",
+                    session_id=self._session_id.split("-cont-")[0],
+                    agent=Agent(
+                        name=self.name(),
+                        version=self.version() or "unknown",
+                        model_name=self._model_name,
+                        extra={
+                            "parser": self._parser_name,
+                            "temperature": self._temperature,
+                        },
+                    ),
+                    steps=canonical_steps,
+                    final_metrics=canonical_metrics,
+                    subagent_trajectories=self._subagent_trajectories or None,
+                )
                 with open(self.logs_dir / "trajectory.json", "w") as f:
-                    f.write(json_str)
+                    f.write(format_trajectory_json(canonical.to_json_dict()))
             self._logger.debug(f"Trajectory dumped to {trajectory_path}")
         except Exception as e:
             self._logger.error(f"Failed to dump trajectory: {e}")
