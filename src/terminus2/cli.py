@@ -127,7 +127,6 @@ def main():
 
 
 async def _run_agent(args):
-    from terminus2.terminus_2 import Terminus2
     from terminus2.agent.context import AgentContext
     from terminus2.environment_local import LocalEnvironment
     from terminus2.model_patch import (
@@ -135,6 +134,7 @@ async def _run_agent(args):
         cleanup_model_patch_baseline,
         write_model_patch,
     )
+    from terminus2.terminus_2 import Terminus2
     from terminus2.trial.paths import TrialPaths
 
     logs_dir = args.logs_dir.resolve()

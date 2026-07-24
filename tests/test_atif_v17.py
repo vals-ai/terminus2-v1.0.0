@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from model_library.base import QueryResultMetadata
 
 from terminus2.agent.context import AgentContext
+from terminus2.terminus_2 import Terminus2, _model_routing
 from terminus2.trajectories.agent import Agent
 from terminus2.trajectories.final_metrics import FinalMetrics
 from terminus2.trajectories.metrics import Metrics
@@ -14,7 +15,6 @@ from terminus2.trajectories.observation_result import ObservationResult
 from terminus2.trajectories.step import Step
 from terminus2.trajectories.tool_call import ToolCall
 from terminus2.trajectories.trajectory import Trajectory
-from terminus2.terminus_2 import Terminus2, _model_routing
 
 
 def test_trajectory_defaults_to_atif_v17() -> None:

@@ -10,8 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-import terminus2.model_patch as model_patch_module
 
+import terminus2.model_patch as model_patch_module
 from terminus2.model_patch import (
     MAX_MODEL_PATCH_BYTES,
     _stats_and_paths,
