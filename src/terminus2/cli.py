@@ -130,6 +130,11 @@ async def _run_agent(args):
     from terminus2.terminus_2 import Terminus2
     from terminus2.agent.context import AgentContext
     from terminus2.environment_local import LocalEnvironment
+    from terminus2.model_patch import (
+        capture_model_patch_baseline,
+        cleanup_model_patch_baseline,
+        write_model_patch,
+    )
     from terminus2.trial.paths import TrialPaths
 
     logs_dir = args.logs_dir.resolve()
@@ -163,18 +168,35 @@ async def _run_agent(args):
 
     # cd the tmux session to the actual working directory (bash --login resets cwd)
     import os
+
     cwd = os.getcwd()
+    repo = Path(cwd)
+    private_paths = [logs_dir]
+    if args.problem_path is not None:
+        private_paths.append(args.problem_path.absolute())
+    baseline = capture_model_patch_baseline(repo, excluded_paths=tuple(private_paths))
     await agent._session.send_keys(keys=[f"cd {cwd}", "Enter"])
     import asyncio as _asyncio
+
     await _asyncio.sleep(0.5)
 
     context = AgentContext()
     print(f"Terminus 2 agent initialized with model: {args.model}")
     print(f"Logs directory: {logs_dir}")
 
-    await agent.run(args.instruction, environment, context)
+    try:
+        await agent.run(args.instruction, environment, context)
 
-    await environment.stop(delete=False)
+        if baseline is not None:
+            _ = write_model_patch(
+                repo,
+                logs_dir,
+                logs_dir / "trajectory.json",
+                baseline,
+            )
+    finally:
+        cleanup_model_patch_baseline(baseline)
+        await environment.stop(delete=False)
 
 
 def _run_validate(args):
