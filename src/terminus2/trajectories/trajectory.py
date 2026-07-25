@@ -12,13 +12,26 @@ from terminus2.trajectories.step import Step
 class Trajectory(BaseModel):
     """Agent Trajectory in ATIF (Agent Trajectory Interchange Format)."""
 
-    schema_version: Literal["ATIF-v1.0", "ATIF-v1.1", "ATIF-v1.2", "ATIF-v1.3", "ATIF-v1.4", "ATIF-v1.5"] = Field(
-        default="ATIF-v1.5",
+    schema_version: Literal[
+        "ATIF-v1.0",
+        "ATIF-v1.1",
+        "ATIF-v1.2",
+        "ATIF-v1.3",
+        "ATIF-v1.4",
+        "ATIF-v1.5",
+        "ATIF-v1.6",
+        "ATIF-v1.7",
+    ] = Field(
+        default="ATIF-v1.7",
         description="String defining ATIF compatibility",
     )
     session_id: str = Field(
         default=...,
         description="Unique identifier for the entire agent run",
+    )
+    trajectory_id: str | None = Field(
+        default=None,
+        description="Identifier for this trajectory document",
     )
     agent: Agent = Field(
         default=...,
@@ -40,6 +53,10 @@ class Trajectory(BaseModel):
     continued_trajectory_ref: str | None = Field(
         default=None,
         description="Reference to the continuation trajectory file if this trajectory is continued in another file",
+    )
+    subagent_trajectories: list["Trajectory"] | None = Field(
+        default=None,
+        description="Subagent trajectories embedded in this document",
     )
     extra: dict[str, Any] | None = Field(
         default=None,
