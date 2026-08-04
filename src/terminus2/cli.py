@@ -132,6 +132,7 @@ async def _run_agent(args):
     from terminus2.model_patch import (
         capture_model_patch_baseline,
         cleanup_model_patch_baseline,
+        find_model_patch_repository,
         write_model_patch,
     )
     from terminus2.terminus_2 import Terminus2
@@ -170,11 +171,15 @@ async def _run_agent(args):
     import os
 
     cwd = os.getcwd()
-    repo = Path(cwd)
+    repo = find_model_patch_repository(Path(cwd))
     private_paths = [logs_dir]
     if args.problem_path is not None:
         private_paths.append(args.problem_path.absolute())
-    baseline = capture_model_patch_baseline(repo, excluded_paths=tuple(private_paths))
+    baseline = (
+        capture_model_patch_baseline(repo, excluded_paths=tuple(private_paths))
+        if repo is not None
+        else None
+    )
     await agent._session.send_keys(keys=[f"cd {cwd}", "Enter"])
     import asyncio as _asyncio
 
@@ -187,7 +192,7 @@ async def _run_agent(args):
     try:
         await agent.run(args.instruction, environment, context)
 
-        if baseline is not None:
+        if baseline is not None and repo is not None:
             _ = write_model_patch(
                 repo,
                 logs_dir,

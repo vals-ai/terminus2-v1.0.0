@@ -110,6 +110,48 @@ def _repository_git_env() -> dict[str, str]:
     return env
 
 
+def _git_repository_root(candidate: Path) -> Path | None:
+    try:
+        return Path(
+            os.path.abspath(
+                _git(
+                    candidate,
+                    "rev-parse",
+                    "--show-toplevel",
+                    env=_repository_git_env(),
+                )
+                .decode()
+                .strip()
+            )
+        )
+    except (OSError, RuntimeError, UnicodeError):
+        return None
+
+
+def find_model_patch_repository(workspace: Path) -> Path | None:
+    """Find the task repository at the workspace root or one directory below it."""
+    workspace = Path(os.path.abspath(workspace))
+    root = _git_repository_root(workspace)
+    if root is not None:
+        return root
+
+    try:
+        candidates = [
+            Path(entry.path)
+            for entry in os.scandir(workspace)
+            if entry.is_dir(follow_symlinks=False)
+        ]
+    except OSError:
+        return None
+
+    roots: list[Path] = []
+    for candidate in candidates:
+        root = _git_repository_root(candidate)
+        if root == candidate:
+            roots.append(root)
+    return roots[0] if len(roots) == 1 else None
+
+
 def _real_object_directory(repo: Path) -> Path:
     raw_path = (
         _git(repo, "rev-parse", "--git-path", "objects", env=_repository_git_env())
