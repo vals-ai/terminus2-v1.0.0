@@ -24,10 +24,9 @@ _DIRECT_SECRET_PATTERNS = (
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
 )
-_ASSIGNED_SECRET_RE = re.compile(
+_ASSIGNED_VALUE_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])"
-    r"[\"']?(?P<key>[A-Za-z0-9_.-]*(?:api[_-]?key|apikey|access[_-]?token|accesstoken|"
-    r"authorization|auth|client[_-]?secret|password|private[_-]?key|secret|token)[A-Za-z0-9_.-]*)[\"']?"
+    r"[\"']?(?P<key>[A-Za-z_][A-Za-z0-9_.-]*)[\"']?"
     r"\s*[:=]\s*(?P<value>(?:(?:bearer|basic)\s+)?"
     r"(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s,};])+)"
 )
@@ -950,14 +949,63 @@ def _is_explicitly_redacted(value: str) -> bool:
     )
 
 
+def _is_secret_key(key: str) -> bool:
+    key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key.strip("\"'"))
+    parts = [part.lower() for part in re.split(r"[_.-]+", key) if part]
+    if any(
+        part
+        in {
+            "apikey",
+            "accesstoken",
+            "authorization",
+            "auth",
+            "clientsecret",
+            "password",
+            "privatekey",
+            "secret",
+            "token",
+        }
+        for part in parts
+    ):
+        return True
+    pairs = set(zip(parts, parts[1:], strict=False))
+    return bool(
+        pairs
+        & {
+            ("api", "key"),
+            ("access", "token"),
+            ("client", "secret"),
+            ("private", "key"),
+        }
+    )
+
+
+def _is_non_secret_assignment_value(value: str) -> bool:
+    value = value.strip().rstrip(",;)}")
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return not value[1:-1].strip()
+    if value.lower() in {"false", "nil", "none", "null", "true"}:
+        return True
+    return bool(
+        re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+",
+            value,
+        )
+    )
+
+
 def _has_unredacted_secret(text: str) -> bool:
     if any(pattern.search(text) for pattern in _DIRECT_SECRET_PATTERNS):
         return True
-    for match in _ASSIGNED_SECRET_RE.finditer(text):
+    for match in _ASSIGNED_VALUE_RE.finditer(text):
         normalized_key = re.sub(r"[^a-z0-9]", "", match.group("key").lower())
-        if normalized_key in _NON_SECRET_TOKEN_KEYS:
+        if normalized_key in _NON_SECRET_TOKEN_KEYS or not _is_secret_key(
+            match.group("key")
+        ):
             continue
-        if not _is_explicitly_redacted(match.group("value")):
+        if not _is_explicitly_redacted(
+            match.group("value")
+        ) and not _is_non_secret_assignment_value(match.group("value")):
             return True
     for match in _CREDENTIALED_URL_RE.finditer(text):
         if not _is_explicitly_redacted(match.group("secret")):
