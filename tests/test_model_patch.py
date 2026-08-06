@@ -290,6 +290,8 @@ def test_excludes_private_harness_directory_recursively(tmp_path: Path) -> None:
     "secret_line",
     [
         'API_KEY = "sk-live-example-secret-value"',
+        "sk_" + "live_" + "1234567890abcdefghijklmnop",
+        "AIza" + "a" * 35,
         '"apiKey": "tiny"',
         "access_token='short'",
         'clientAuthToken = "abc"',
@@ -324,6 +326,24 @@ def test_omits_patch_when_diff_contains_secret(
     assert trajectory_path.read_text() == original
     assert _object_inventory(repo) == objects_before
     assert not state_dir.exists()
+
+
+def test_omits_patch_when_diff_contains_exact_injected_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    injected = "provider-value-without-a-recognizable-prefix"
+    monkeypatch.setenv("TEST_PROVIDER_API_KEY", injected)
+    (repo / "example.py").write_text(injected + "\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+
+    assert not write_model_patch(repo, logs_dir, trajectory_path, baseline)
+    assert not (logs_dir / "artifacts/model.patch").exists()
 
 
 @pytest.mark.parametrize(

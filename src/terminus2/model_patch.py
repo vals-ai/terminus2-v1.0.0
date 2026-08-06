@@ -23,6 +23,11 @@ _DIRECT_SECRET_PATTERNS = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+)
+_SECRET_ENV_NAME_RE = re.compile(
+    r"(?i)(?:^|_)(?:API_KEY|ACCESS_KEY|SECRET_ACCESS_KEY|TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIALS?)$"
 )
 _ASSIGNED_VALUE_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])"
@@ -997,6 +1002,14 @@ def _is_non_secret_assignment_value(value: str) -> bool:
 def _has_unredacted_secret(text: str) -> bool:
     if any(pattern.search(text) for pattern in _DIRECT_SECRET_PATTERNS):
         return True
+    for name, value in os.environ.items():
+        if (
+            _SECRET_ENV_NAME_RE.search(name)
+            and len(value) >= 8
+            and not _is_explicitly_redacted(value)
+            and value in text
+        ):
+            return True
     for match in _ASSIGNED_VALUE_RE.finditer(text):
         normalized_key = re.sub(r"[^a-z0-9]", "", match.group("key").lower())
         if normalized_key in _NON_SECRET_TOKEN_KEYS or not _is_secret_key(

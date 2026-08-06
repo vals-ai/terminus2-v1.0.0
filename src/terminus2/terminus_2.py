@@ -74,16 +74,41 @@ class Command:
     duration_sec: float
 
 
-def _terminal_observation_source_call_id(
+def _terminal_tool_calls(
     commands: list[Command], episode: int, *, is_task_complete: bool = False
-) -> str | None:
-    if commands and is_task_complete:
-        return None
-    if len(commands) == 1:
-        return f"call_{episode}_1"
-    if not commands and is_task_complete:
-        return f"call_{episode}_task_complete"
-    return None
+) -> list[ToolCall]:
+    if commands and (len(commands) > 1 or is_task_complete):
+        return [
+            ToolCall(
+                tool_call_id=f"call_{episode}_terminal_batch",
+                function_name="terminal_batch",
+                arguments={
+                    "commands": [
+                        {"keystrokes": command.keystrokes, "duration": command.duration_sec}
+                        for command in commands
+                    ],
+                    "task_complete": is_task_complete,
+                },
+            )
+        ]
+    if commands:
+        command = commands[0]
+        return [
+            ToolCall(
+                tool_call_id=f"call_{episode}_1",
+                function_name="bash_command",
+                arguments={"keystrokes": command.keystrokes, "duration": command.duration_sec},
+            )
+        ]
+    if is_task_complete:
+        return [
+            ToolCall(
+                tool_call_id=f"call_{episode}_task_complete",
+                function_name="mark_task_complete",
+                arguments={},
+            )
+        ]
+    return []
 
 
 class Terminus2(BaseAgent):
@@ -1044,64 +1069,13 @@ so ask everything you need to know."""
 
             if not self._save_raw_content_in_trajectory:
                 # Only create tool_calls when NOT in raw_content mode
-                tool_calls_list: list[ToolCall] = []
-
-                if commands:
-                    for i, cmd in enumerate(commands):
-                        tool_call_id = f"call_{episode}_{i + 1}"
-                        tool_calls_list.append(
-                            ToolCall(
-                                tool_call_id=tool_call_id,
-                                function_name="bash_command",
-                                arguments={
-                                    "keystrokes": cmd.keystrokes,
-                                    "duration": cmd.duration_sec,
-                                },
-                            )
-                        )
-
-                    # Multi-command batches share one terminal output, so only
-                    # single-command observations can be linked precisely.
-                    observation_results.append(
-                        ObservationResult(
-                            source_call_id=_terminal_observation_source_call_id(
-                                commands,
-                                episode,
-                                is_task_complete=is_task_complete,
-                            ),
-                            content=observation,
-                        )
+                tool_calls_list = _terminal_tool_calls(commands, episode, is_task_complete=is_task_complete)
+                observation_results.append(
+                    ObservationResult(
+                        source_call_id=tool_calls_list[0].tool_call_id if tool_calls_list else None,
+                        content=observation,
                     )
-
-                # Add task_complete as a tool call if the agent marked the task complete
-                if is_task_complete:
-                    task_complete_call_id = f"call_{episode}_task_complete"
-                    tool_calls_list.append(
-                        ToolCall(
-                            tool_call_id=task_complete_call_id,
-                            function_name="mark_task_complete",
-                            arguments={},
-                        )
-                    )
-                    # If there are no commands, we still need to add an observation result
-                    if not commands:
-                        observation_results.append(
-                            ObservationResult(
-                                source_call_id=_terminal_observation_source_call_id(
-                                    commands,
-                                    episode,
-                                    is_task_complete=True,
-                                ),
-                                content=observation,
-                            )
-                        )
-                elif not commands:
-                    # No commands and no task completion, just the observation
-                    observation_results.append(
-                        ObservationResult(
-                            content=observation,
-                        )
-                    )
+                )
 
                 tool_calls = tool_calls_list or None
             else:
