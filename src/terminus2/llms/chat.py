@@ -8,6 +8,32 @@ from model_library.base.input import InputItem, TextInput
 from model_library.base.output import QueryResult
 
 
+def _is_sendable(message: object) -> bool:
+    """Whether a history entry can be sent back to a provider.
+
+    A reasoning model can return no content at all, having spent its whole
+    output budget thinking. The assistant turn that describes it then carries
+    neither content nor tool calls, and providers reject a request containing
+    one -- DeepSeek with "Invalid assistant message: content or tool_calls must
+    be set" -- so the run ends on the following turn rather than continuing.
+    """
+
+    if isinstance(message, dict):
+        if message.get("role") != "assistant":
+            return True
+        return bool(message.get("content")) or bool(message.get("tool_calls"))
+
+    if getattr(message, "role", None) != "assistant":
+        return True
+    return bool(getattr(message, "content", None)) or bool(getattr(message, "tool_calls", None))
+
+
+def _without_unsendable_turns(history: list) -> list:
+    """Drop assistant turns a provider will not accept back."""
+
+    return [message for message in history if _is_sendable(message)]
+
+
 class Chat:
     """Manages conversation history and LLM interactions."""
 
@@ -50,7 +76,7 @@ class Chat:
         )
 
         # save message history
-        self._messages = query_result.history
+        self._messages = _without_unsendable_turns(query_result.history)
 
         # add the query metadata
         self._metadata.append(query_result.metadata)
