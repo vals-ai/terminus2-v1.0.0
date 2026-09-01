@@ -784,7 +784,9 @@ so ask everything you need to know."""
             )
 
             chat.messages.append(TextInput(text=prompt))
-            chat.messages.append({"role": "assistant", "content": ""})
+            # Not an empty string: providers read that as unset and reject the
+            # next request with "content or tool_calls must be set".
+            chat.messages.append({"role": "assistant", "content": "(no output produced)"})
 
             if response_path is not None:
                 response_path.write_text(error_msg)
