@@ -8,30 +8,47 @@ from model_library.base.input import InputItem, TextInput
 from model_library.base.output import QueryResult
 
 
-def _is_sendable(message: object) -> bool:
+def _field(payload: object, name: str) -> object:
+    """Read a field from a provider message, which may be a model or a dict."""
+
+    if isinstance(payload, dict):
+        return payload.get(name)
+    return getattr(payload, name, None)
+
+
+def _is_sendable(item: object) -> bool:
     """Whether a history entry can be sent back to a provider.
 
     A reasoning model can return no content at all, having spent its whole
-    output budget thinking. The assistant turn that describes it then carries
-    neither content nor tool calls, and providers reject a request containing
-    one -- DeepSeek with "Invalid assistant message: content or tool_calls must
-    be set" -- so the run ends on the following turn rather than continuing.
+    output budget thinking. model-library stores the turn as
+    `RawResponse(response=<provider message>)`, and that message then carries
+    neither content nor tool calls. Providers reject a request containing one --
+    DeepSeek with "Invalid assistant message: content or tool_calls must be
+    set" -- so the run ends on the following turn.
+
+    Only that wrapper is inspected. Prompts, system messages and tool results
+    are other `InputItem` kinds and are always kept.
     """
 
-    if isinstance(message, dict):
-        if message.get("role") != "assistant":
-            return True
-        return bool(message.get("content")) or bool(message.get("tool_calls"))
-
-    if getattr(message, "role", None) != "assistant":
+    payload = _field(item, "response")
+    if payload is None:
         return True
-    return bool(getattr(message, "content", None)) or bool(getattr(message, "tool_calls", None))
+
+    # The responses API stores a list of output items rather than one message;
+    # judging those is not attempted.
+    if isinstance(payload, (list, tuple)):
+        return True
+
+    if _field(payload, "role") != "assistant":
+        return True
+
+    return bool(_field(payload, "content")) or bool(_field(payload, "tool_calls"))
 
 
-def _without_unsendable_turns(history: list) -> list:
+def _without_unsendable_turns(history: list[InputItem]) -> list[InputItem]:
     """Drop assistant turns a provider will not accept back."""
 
-    return [message for message in history if _is_sendable(message)]
+    return [item for item in history if _is_sendable(item)]
 
 
 class Chat:
