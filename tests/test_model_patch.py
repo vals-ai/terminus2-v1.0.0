@@ -430,6 +430,29 @@ def test_allows_known_non_secret_token_metrics(
     assert write_model_patch(repo, logs_dir, trajectory_path, baseline)
 
 
+@pytest.mark.parametrize(
+    "source_line",
+    [
+        "__author__ = 'Marcel Hellkamp'",
+        "secret = None",
+        "password = request.auth or (None, None)",
+    ],
+)
+def test_allows_non_secret_auth_related_assignments(
+    tmp_path: Path, source_line: str
+) -> None:
+    repo, _ = _repo(tmp_path)
+    baseline = capture_model_patch_baseline(repo)
+    assert baseline is not None
+    (repo / "example.py").write_text(f"{source_line}\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    trajectory_path = logs_dir / "trajectory.json"
+    _trajectory(trajectory_path)
+
+    assert write_model_patch(repo, logs_dir, trajectory_path, baseline)
+
+
 def test_omits_binary_patch(tmp_path: Path) -> None:
     repo, _ = _repo(tmp_path)
     objects_before = _object_inventory(repo)
