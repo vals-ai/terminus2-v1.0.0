@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -9,18 +10,31 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from terminus2.cli import _run_agent
-from terminus2.model_patch import ModelPatchBaseline
+from terminus2.model_patch import ModelPatchBaseline, find_model_patch_repository
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
 
 
 def test_run_captures_pre_model_baseline_and_excludes_private_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    private_problem = repo / "private-task.md"
+    workspace = tmp_path / "workspace"
+    repo = workspace / "dclm"
+    repo.mkdir(parents=True)
+    _ = _git(repo, "init")
+    private_problem = workspace / "private-task.md"
     private_problem.write_text("hidden task\n")
-    logs_dir = repo / "private-logs"
+    logs_dir = tmp_path / "private-logs"
     events: list[str] = []
     baseline = ModelPatchBaseline("a" * 40, "b" * 40)
 
@@ -42,7 +56,7 @@ def test_run_captures_pre_model_baseline_and_excludes_private_inputs(
     )
     monkeypatch.setattr("terminus2.model_patch.capture_model_patch_baseline", capture)
     monkeypatch.setattr("terminus2.model_patch.write_model_patch", write)
-    monkeypatch.setattr(os, "getcwd", lambda: str(repo))
+    monkeypatch.setattr(os, "getcwd", lambda: str(workspace))
 
     args = SimpleNamespace(
         logs_dir=logs_dir,
@@ -73,12 +87,25 @@ def test_run_captures_pre_model_baseline_and_excludes_private_inputs(
     )
 
 
+def test_model_patch_repository_discovery_rejects_ambiguous_children(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    repos = [workspace / "first", workspace / "second"]
+    for repo in repos:
+        repo.mkdir(parents=True)
+        _ = _git(repo, "init")
+
+    assert find_model_patch_repository(workspace) is None
+
+
 def test_run_failure_cleans_model_patch_state_and_stops_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
+    _ = _git(repo, "init")
     logs_dir = repo / "logs"
     events: list[str] = []
     baseline = ModelPatchBaseline("a" * 40, "b" * 40, state_dir="/isolated/state")
