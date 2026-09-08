@@ -2,7 +2,9 @@
 
 import argparse
 import asyncio
+import os
 import sys
+import threading
 import traceback
 from pathlib import Path
 
@@ -131,30 +133,90 @@ _AGENT_ERROR_FILENAME = "error.log"
 # Enough for a traceback and the exception message, bounded so a pathological
 # provider payload cannot fill the trial's log mount.
 _AGENT_ERROR_MAX_BYTES = 64 * 1024
+# Waiting is only worth it to let a healthy write finish. Measured at this size,
+# a write and rename takes about 0.6ms and at most 5ms, so this is ~50x the
+# worst observed case: ample for a slower mount, and a delay too small to matter
+# to a process already on its way down. A mount needing longer will not answer.
+_AGENT_ERROR_WRITE_TIMEOUT_SECONDS = 0.25
+
+
+def _warn(message: str) -> None:
+    """Report a problem without ever becoming one.
+
+    Called from a thread that may outlive the main one, at which point stderr
+    can already be closed. An exception here would surface as noise attributed
+    to the wrong failure.
+    """
+
+    try:
+        print(message, file=sys.stderr)
+    except BaseException:  # noqa: BLE001 - reporting must not raise
+        pass
 
 
 def _agent_error_path(trial_paths) -> Path:
     return trial_paths.agent_dir / _AGENT_ERROR_FILENAME
 
 
+def _agent_staging_path(target: Path) -> Path:
+    return target.with_suffix(target.suffix + ".partial")
+
+
 def _clear_agent_error(trial_paths) -> None:
-    try:
-        _agent_error_path(trial_paths).unlink(missing_ok=True)
-    except OSError:
-        pass
+    """Remove what an earlier attempt on this mount may have left behind.
+
+    Both names: an abandoned write leaves the staging file, and a stale one of
+    either kind travelling beside a trial that passed misreports it.
+    """
+
+    target = _agent_error_path(trial_paths)
+    for path in (target, _agent_staging_path(target)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _record_agent_error(trial_paths) -> None:
-    """Write the current traceback where the run's artifacts are collected."""
+    """Write the current traceback where the run's artifacts are collected.
 
-    try:
-        trial_paths.mkdir()
-        detail = traceback.format_exc()
-        if len(detail) > _AGENT_ERROR_MAX_BYTES:
-            detail = detail[: _AGENT_ERROR_MAX_BYTES] + "\n... [truncated]\n"
-        _agent_error_path(trial_paths).write_text(detail)
-    except BaseException as write_error:  # noqa: BLE001 - must not mask the original
-        print(f"Could not record agent error: {write_error!r}", file=sys.stderr)
+    This runs while an exception is on its way out of the agent, and the
+    directory it targets is a mounted volume, so a direct write against an
+    unresponsive mount would delay the process exiting for as long as the mount
+    took -- turning a prompt failure into one a harness reads as a hang.
+
+    The write moves to a thread waited on for a fixed moment, which caps that
+    delay rather than removing it: the caller is async, so this does block its
+    loop for up to the timeout. The bound comes from what a healthy write
+    actually costs, so a working mount still produces the file and a broken one
+    is abandoned.
+    """
+
+    detail = traceback.format_exc()
+    if len(detail) > _AGENT_ERROR_MAX_BYTES:
+        detail = detail[:_AGENT_ERROR_MAX_BYTES] + "\n... [truncated]\n"
+
+    def write() -> None:
+        try:
+            trial_paths.mkdir()
+            # Written beside the target and renamed into place. The thread below
+            # is abandoned if it takes too long, and a daemon thread is killed
+            # outright at interpreter shutdown, so a direct write could leave a
+            # half-written traceback behind. A rename cannot: the file is either
+            # absent or complete.
+            target = _agent_error_path(trial_paths)
+            staging = _agent_staging_path(target)
+            staging.write_text(detail)
+            os.replace(staging, target)
+        except BaseException as write_error:  # noqa: BLE001 - must not mask the original
+            _warn(f"Could not record agent error: {write_error!r}")
+
+    # Daemon, so an abandoned write cannot keep the interpreter alive either.
+    worker = threading.Thread(target=write, name="record-agent-error", daemon=True)
+    worker.start()
+    worker.join(_AGENT_ERROR_WRITE_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        _warn(f"Gave up recording the agent error after {_AGENT_ERROR_WRITE_TIMEOUT_SECONDS}s")
 
 
 async def _run_agent(args):
