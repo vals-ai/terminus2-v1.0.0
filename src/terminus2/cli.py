@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import sys
+import traceback
 from pathlib import Path
 
 
@@ -126,6 +127,36 @@ def main():
         asyncio.run(_run_agent(args))
 
 
+_AGENT_ERROR_FILENAME = "error.log"
+# Enough for a traceback and the exception message, bounded so a pathological
+# provider payload cannot fill the trial's log mount.
+_AGENT_ERROR_MAX_BYTES = 64 * 1024
+
+
+def _agent_error_path(trial_paths) -> Path:
+    return trial_paths.agent_dir / _AGENT_ERROR_FILENAME
+
+
+def _clear_agent_error(trial_paths) -> None:
+    try:
+        _agent_error_path(trial_paths).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _record_agent_error(trial_paths) -> None:
+    """Write the current traceback where the run's artifacts are collected."""
+
+    try:
+        trial_paths.mkdir()
+        detail = traceback.format_exc()
+        if len(detail) > _AGENT_ERROR_MAX_BYTES:
+            detail = detail[: _AGENT_ERROR_MAX_BYTES] + "\n... [truncated]\n"
+        _agent_error_path(trial_paths).write_text(detail)
+    except BaseException as write_error:  # noqa: BLE001 - must not mask the original
+        print(f"Could not record agent error: {write_error!r}", file=sys.stderr)
+
+
 async def _run_agent(args):
     from terminus2.agent.context import AgentContext
     from terminus2.environment_local import LocalEnvironment
@@ -163,28 +194,35 @@ async def _run_agent(args):
     trial_paths = TrialPaths(trial_dir=logs_dir)
     environment = LocalEnvironment(trial_paths=trial_paths)
 
-    await environment.start(force_build=False)
-    await agent.setup(environment)
+    # A previous attempt on this mount may have left one behind, and a stale
+    # traceback beside a passing trial is worse than none at all.
+    _clear_agent_error(trial_paths)
 
-    # cd the tmux session to the actual working directory (bash --login resets cwd)
-    import os
-
-    cwd = os.getcwd()
-    repo = Path(cwd)
-    private_paths = [logs_dir]
-    if args.problem_path is not None:
-        private_paths.append(args.problem_path.absolute())
-    baseline = capture_model_patch_baseline(repo, excluded_paths=tuple(private_paths))
-    await agent._session.send_keys(keys=[f"cd {cwd}", "Enter"])
-    import asyncio as _asyncio
-
-    await _asyncio.sleep(0.5)
-
-    context = AgentContext()
-    print(f"Terminus 2 agent initialized with model: {args.model}")
-    print(f"Logs directory: {logs_dir}")
-
+    baseline = None
+    started = False
     try:
+        await environment.start(force_build=False)
+        started = True
+        await agent.setup(environment)
+
+        # cd the tmux session to the actual working directory (bash --login resets cwd)
+        import os
+
+        cwd = os.getcwd()
+        repo = Path(cwd)
+        private_paths = [logs_dir]
+        if args.problem_path is not None:
+            private_paths.append(args.problem_path.absolute())
+        baseline = capture_model_patch_baseline(repo, excluded_paths=tuple(private_paths))
+        await agent._session.send_keys(keys=[f"cd {cwd}", "Enter"])
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(0.5)
+
+        context = AgentContext()
+        print(f"Terminus 2 agent initialized with model: {args.model}")
+        print(f"Logs directory: {logs_dir}")
+
         await agent.run(args.instruction, environment, context)
 
         if baseline is not None:
@@ -194,9 +232,21 @@ async def _run_agent(args):
                 logs_dir / "trajectory.json",
                 baseline,
             )
+    except BaseException:
+        # Otherwise the only trace of a failure is the process exit status. A
+        # harness reports that as a non-zero exit, retries the task, and the
+        # retry overwrites the current copy of the agent's uploaded logs, so
+        # the attempt that failed is not the one anybody reads afterwards.
+        # `agent_dir` is already created and already collected, so recording it
+        # here makes the failure travel with the run. Setup is inside the block
+        # too: an environment that never starts is exactly the case that used
+        # to leave nothing behind.
+        _record_agent_error(trial_paths)
+        raise
     finally:
         cleanup_model_patch_baseline(baseline)
-        await environment.stop(delete=False)
+        if started:
+            await environment.stop(delete=False)
 
 
 def _run_validate(args):

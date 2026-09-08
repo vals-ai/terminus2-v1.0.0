@@ -13,6 +13,7 @@ from model_library.base.output import QueryResult, QueryResultMetadata
 from model_library.exceptions import (
     MaxContextWindowExceededError,
     MaxOutputTokensExceededError,
+    ModelNoOutputError,
 )
 from tenacity import retry, stop_after_attempt
 
@@ -83,6 +84,39 @@ def _terminal_observation_source_call_id(
         return f"call_{episode}_1"
     if not commands and is_task_complete:
         return f"call_{episode}_task_complete"
+    return None
+
+
+_NO_OUTPUT_ERROR_NAME = ModelNoOutputError.__name__
+
+
+def _no_output_error_name(error: BaseException) -> str | None:
+    """Return a label when `error` means the model produced no usable output.
+
+    Three transports carry that condition and none of them presents the same
+    type, which is why matching on `ModelNoOutputError` alone catches nothing
+    in practice:
+
+    * A direct provider call raises `ModelNoOutputError`, but that is an
+      `ImmediateRetryException`, so model-library's retrier rewraps it as
+      `ImmediateRetryExhaustedError` once its attempts are spent, keeping the
+      cause on `.original`.
+    * Through the gateway only `MaxContextWindowExceededError` is remapped to
+      its own type. Everything else arrives as `GatewayProviderError` carrying
+      the original class name in `.exception_type`.
+
+    Content filtering is deliberately not included. `handle_empty_response`
+    maps both CONTENT_FILTER and GUARDRAIL onto `ContentFilterError`, and a
+    misconfigured guardrail is an infrastructure fault that has to stay loud
+    instead of being recorded as a model failure.
+    """
+
+    if isinstance(error, ModelNoOutputError):
+        return _NO_OUTPUT_ERROR_NAME
+    if isinstance(getattr(error, "original", None), ModelNoOutputError):
+        return _NO_OUTPUT_ERROR_NAME
+    if getattr(error, "exception_type", None) == _NO_OUTPUT_ERROR_NAME:
+        return _NO_OUTPUT_ERROR_NAME
     return None
 
 
@@ -875,6 +909,47 @@ so ask everything you need to know."""
 
         return False, self._limit_output_length(await session.get_incremental_output())
 
+    def _flush_pending_summarization_steps(self) -> None:
+        """Record any summarization that happened during the last query.
+
+        Summarization is performed inside `_query_llm`, so a query that
+        summarises and then fails leaves these pending. They must be recorded
+        on the way out as well as on the normal path, or the trajectory embeds
+        subagent trajectories that no step refers to.
+        """
+
+        # This must happen before we build the agent step. We use
+        # len(self._trajectory_steps) + 1 as the step_id to keep it sequential.
+        if self._pending_subagent_refs:
+            self._trajectory_steps.append(
+                Step(
+                    step_id=len(self._trajectory_steps) + 1,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    source="system",
+                    message="Performed context summarization and handoff to continue task.",
+                    observation=Observation(
+                        results=[ObservationResult(subagent_trajectory_ref=self._pending_subagent_refs)]
+                    ),
+                )
+            )
+            self._pending_subagent_refs = None
+
+        if self._pending_handoff_prompt:
+            # In linear_history mode the trajectory is split immediately and the
+            # handoff step is added to the continuation trajectory by the split.
+            if self._linear_history:
+                self._split_trajectory_on_summarization(self._pending_handoff_prompt)
+            else:
+                self._trajectory_steps.append(
+                    Step(
+                        step_id=len(self._trajectory_steps) + 1,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        source="user",
+                        message=self._pending_handoff_prompt,
+                    )
+                )
+            self._pending_handoff_prompt = None
+
     async def _run_agent_loop(
         self,
         initial_prompt: str,
@@ -915,49 +990,50 @@ so ask everything you need to know."""
 
             logging_paths = self._setup_episode_logging(logging_dir, episode)
 
-            (
-                commands,
-                is_task_complete,
-                feedback,
-                analysis,
-                plan,
-                query_result,
-            ) = await self._handle_llm_interaction(chat, prompt, logging_paths, original_instruction, self._session)
+            try:
+                (
+                    commands,
+                    is_task_complete,
+                    feedback,
+                    analysis,
+                    plan,
+                    query_result,
+                ) = await self._handle_llm_interaction(
+                    chat, prompt, logging_paths, original_instruction, self._session
+                )
+            except BaseException as error:
+                no_output = _no_output_error_name(error)
+                if no_output is None:
+                    # Anything else is a fault in the harness, the environment
+                    # or the transport. It must keep aborting the run, so it is
+                    # never recorded as an attempt the model completed.
+                    raise
 
-            # If we have pending subagent refs, add a system step to record the delegation
-            # This must happen before we build the agent step
-            # We use len(self._trajectory_steps) + 1 as the step_id to ensure it's sequential
-            if self._pending_subagent_refs:
+                # The model was asked, retried by model-library, and still
+                # returned nothing usable. That is a failure of the model, and
+                # the work of every prior episode is already on disk, so end
+                # here and let it be graded rather than discarding it and
+                # spending the task's whole timeout again from scratch.
+                self._logger.error(f"Ending run: model returned no usable output ({no_output})")
+                self._flush_pending_summarization_steps()
                 self._trajectory_steps.append(
                     Step(
                         step_id=len(self._trajectory_steps) + 1,
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         source="system",
-                        message="Performed context summarization and handoff to continue task.",
-                        observation=Observation(
-                            results=[ObservationResult(subagent_trajectory_ref=self._pending_subagent_refs)]
+                        message=(
+                            f"Run ended early: the model returned no usable output ({no_output}). "
+                            "Any score for this attempt reflects the work completed before that point."
                         ),
                     )
                 )
-                self._pending_subagent_refs = None
+                # This episode did not complete, so it is not counted. The
+                # marker step above is what distinguishes a score reached this
+                # way from one the model earned outright.
+                self._n_episodes = episode
+                return episode
 
-            # Handle handoff prompt based on linear_history mode
-            if self._pending_handoff_prompt:
-                # If linear_history mode is enabled, split trajectory immediately WITHOUT adding handoff step
-                # The handoff step will be added to the continuation trajectory during the split
-                if self._linear_history:
-                    self._split_trajectory_on_summarization(self._pending_handoff_prompt)
-                else:
-                    # For non-linear mode, add the handoff prompt as a user step
-                    self._trajectory_steps.append(
-                        Step(
-                            step_id=len(self._trajectory_steps) + 1,
-                            timestamp=datetime.now(timezone.utc).isoformat(),
-                            source="user",
-                            message=self._pending_handoff_prompt,
-                        )
-                    )
-                self._pending_handoff_prompt = None
+            self._flush_pending_summarization_steps()
 
             # Create message content from analysis and plan, or use raw response if raw_content is enabled
             if self._save_raw_content_in_trajectory:
