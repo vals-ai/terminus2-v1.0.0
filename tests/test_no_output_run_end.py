@@ -19,7 +19,7 @@ from model_library.exceptions import (
     ModelNoOutputError,
 )
 
-from terminus2.terminus_2 import Terminus2, _no_output_error_name
+from terminus2.terminus_2 import Terminus2, _unusable_output_error_name
 from terminus2.trajectories.subagent_trajectory_ref import SubagentTrajectoryRef
 
 
@@ -36,27 +36,53 @@ def gateway_error(exception_type: str) -> GatewayProviderError:
 
 class DiscriminatorTests(unittest.TestCase):
     def test_direct_error_is_recognised(self) -> None:
-        self.assertEqual(_no_output_error_name(ModelNoOutputError()), "ModelNoOutputError")
+        self.assertEqual(_unusable_output_error_name(ModelNoOutputError()), "ModelNoOutputError")
 
     def test_rewrapped_by_the_immediate_retrier_is_recognised(self) -> None:
         wrapped = ImmediateRetryExhaustedError(10, 10, ModelNoOutputError())
         # The retrier's own type is unrelated to the cause it carries.
         self.assertNotIsInstance(wrapped, ModelNoOutputError)
-        self.assertEqual(_no_output_error_name(wrapped), "ModelNoOutputError")
+        self.assertEqual(_unusable_output_error_name(wrapped), "ModelNoOutputError")
 
     def test_gateway_envelope_is_recognised(self) -> None:
         # The shape every run in gateway mode actually produces.
-        self.assertEqual(_no_output_error_name(gateway_error("ModelNoOutputError")), "ModelNoOutputError")
+        self.assertEqual(_unusable_output_error_name(gateway_error("ModelNoOutputError")), "ModelNoOutputError")
+
+    def test_the_gateway_max_tokens_envelope_is_recognised(self) -> None:
+        self.assertEqual(
+            _unusable_output_error_name(gateway_error("MaxOutputTokensExceededError")),
+            "MaxOutputTokensExceededError",
+        )
+
+    def test_a_direct_max_tokens_error_is_recognised_too(self) -> None:
+        from model_library.exceptions import MaxOutputTokensExceededError
+
+        self.assertEqual(
+            _unusable_output_error_name(MaxOutputTokensExceededError()),
+            "MaxOutputTokensExceededError",
+        )
+
+    def test_a_context_overflow_is_not_recognised(self) -> None:
+        # Summarization handles this; it must not end the run.
+        self.assertIsNone(_unusable_output_error_name(gateway_error("MaxContextWindowExceededError")))
+
+    def test_a_malformed_error_name_does_not_raise(self) -> None:
+        # This runs inside the loop's except block, so raising here would mask
+        # the error being classified.
+        class Malformed(Exception):
+            exception_type = ["not-a-name"]
+
+        self.assertIsNone(_unusable_output_error_name(Malformed()))
 
     def test_content_filter_is_not_recognised(self) -> None:
         # CONTENT_FILTER and GUARDRAIL share this type, and a misconfigured
         # guardrail is infrastructure: it must not be graded as a model result.
-        self.assertIsNone(_no_output_error_name(ContentFilterError("blocked")))
-        self.assertIsNone(_no_output_error_name(gateway_error("ContentFilterError")))
+        self.assertIsNone(_unusable_output_error_name(ContentFilterError("blocked")))
+        self.assertIsNone(_unusable_output_error_name(gateway_error("ContentFilterError")))
 
     def test_unrelated_failures_are_not_recognised(self) -> None:
-        self.assertIsNone(_no_output_error_name(RuntimeError("environment gone")))
-        self.assertIsNone(_no_output_error_name(ImmediateRetryExhaustedError(10, 10, OSError("connect"))))
+        self.assertIsNone(_unusable_output_error_name(RuntimeError("environment gone")))
+        self.assertIsNone(_unusable_output_error_name(ImmediateRetryExhaustedError(10, 10, OSError("connect"))))
 
 
 class LoopEndsRunTests(unittest.IsolatedAsyncioTestCase):
@@ -82,6 +108,14 @@ class LoopEndsRunTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(episodes, 0, "the failed episode must not be counted as completed")
         self.assertEqual(agent._n_episodes, 0)
+
+    async def test_gateway_max_tokens_ends_the_run(self) -> None:
+        agent = self._agent(gateway_error("MaxOutputTokensExceededError"))
+
+        episodes = await agent._run_agent_loop(initial_prompt="go", chat=SimpleNamespace())
+
+        self.assertEqual(episodes, 0, "the failed episode must not be counted as completed")
+        self.assertIn("MaxOutputTokensExceededError", agent._trajectory_steps[0].message)
 
     async def test_a_marker_step_records_why_the_score_stands(self) -> None:
         agent = self._agent(ImmediateRetryExhaustedError(10, 10, ModelNoOutputError()))

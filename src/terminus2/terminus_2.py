@@ -87,23 +87,32 @@ def _terminal_observation_source_call_id(
     return None
 
 
-_NO_OUTPUT_ERROR_NAME = ModelNoOutputError.__name__
+_UNUSABLE_OUTPUT_ERRORS: tuple[type[Exception], ...] = (
+    ModelNoOutputError,
+    MaxOutputTokensExceededError,
+)
+_UNUSABLE_OUTPUT_ERROR_NAMES = frozenset(error.__name__ for error in _UNUSABLE_OUTPUT_ERRORS)
 
 
-def _no_output_error_name(error: BaseException) -> str | None:
-    """Return a label when `error` means the model produced no usable output.
+def _unusable_output_error_name(error: BaseException) -> str | None:
+    """Return a label when `error` means the model returned nothing to act on.
 
-    Three transports carry that condition and none of them presents the same
-    type, which is why matching on `ModelNoOutputError` alone catches nothing
-    in practice:
+    Two conditions qualify: the model produced no output, and it exhausted its
+    output budget with nothing useful in it. Both leave the agent nothing to do.
 
-    * A direct provider call raises `ModelNoOutputError`, but that is an
+    Three transports carry them and none presents the same type, which is why
+    matching on the exception classes alone catches nothing in practice:
+
+    * A direct call raises `ModelNoOutputError`, but that is an
       `ImmediateRetryException`, so model-library's retrier rewraps it as
       `ImmediateRetryExhaustedError` once its attempts are spent, keeping the
       cause on `.original`.
     * Through the gateway only `MaxContextWindowExceededError` is remapped to
       its own type. Everything else arrives as `GatewayProviderError` carrying
       the original class name in `.exception_type`.
+    * `MaxOutputTokensExceededError` is a `NoRetryException`, so it is not
+      retried and arrives whole. Its direct form is normally caught earlier by
+      the handler in `_query_llm`, leaving the gateway form to reach here.
 
     Content filtering is deliberately not included. `handle_empty_response`
     maps both CONTENT_FILTER and GUARDRAIL onto `ContentFilterError`, and a
@@ -111,12 +120,12 @@ def _no_output_error_name(error: BaseException) -> str | None:
     instead of being recorded as a model failure.
     """
 
-    if isinstance(error, ModelNoOutputError):
-        return _NO_OUTPUT_ERROR_NAME
-    if isinstance(getattr(error, "original", None), ModelNoOutputError):
-        return _NO_OUTPUT_ERROR_NAME
-    if getattr(error, "exception_type", None) == _NO_OUTPUT_ERROR_NAME:
-        return _NO_OUTPUT_ERROR_NAME
+    for candidate in (error, getattr(error, "original", None)):
+        if isinstance(candidate, _UNUSABLE_OUTPUT_ERRORS):
+            return type(candidate).__name__
+    name = getattr(error, "exception_type", None)
+    if isinstance(name, str) and name in _UNUSABLE_OUTPUT_ERROR_NAMES:
+        return name
     return None
 
 
@@ -1002,19 +1011,17 @@ so ask everything you need to know."""
                     chat, prompt, logging_paths, original_instruction, self._session
                 )
             except BaseException as error:
-                no_output = _no_output_error_name(error)
-                if no_output is None:
+                unusable = _unusable_output_error_name(error)
+                if unusable is None:
                     # Anything else is a fault in the harness, the environment
                     # or the transport. It must keep aborting the run, so it is
                     # never recorded as an attempt the model completed.
                     raise
 
-                # The model was asked, retried by model-library, and still
-                # returned nothing usable. That is a failure of the model, and
-                # the work of every prior episode is already on disk, so end
-                # here and let it be graded rather than discarding it and
-                # spending the task's whole timeout again from scratch.
-                self._logger.error(f"Ending run: model returned no usable output ({no_output})")
+                # A model failure, and every prior episode's work is
+                # already on disk, so end here and let it be graded rather
+                # than spending the task's whole timeout again from scratch.
+                self._logger.error(f"Ending run: model returned no usable output ({unusable})")
                 self._flush_pending_summarization_steps()
                 self._trajectory_steps.append(
                     Step(
@@ -1022,7 +1029,7 @@ so ask everything you need to know."""
                         timestamp=datetime.now(timezone.utc).isoformat(),
                         source="system",
                         message=(
-                            f"Run ended early: the model returned no usable output ({no_output}). "
+                            f"Run ended early: the model returned no usable output ({unusable}). "
                             "Any score for this attempt reflects the work completed before that point."
                         ),
                     )
