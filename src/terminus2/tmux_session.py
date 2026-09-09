@@ -283,21 +283,16 @@ class TmuxSession:
 
     @property
     def _tmux_start_session(self) -> str:
-        # Return a single command string instead of a list
-        # Use script to create a pseudo-TTY for tmux without needing Docker's -it flags
         return (
             f"export TERM=xterm-256color && "
             f"export SHELL=/bin/bash && "
-            # Use script to allocate a PTY for tmux
-            f'script -qc "'
             f"tmux new-session -x {self._pane_width} -y {self._pane_height} -d -s {self._session_name} 'bash --login' \\; "
             f"pipe-pane -t {self._session_name} "
             f"'cat > {self._logging_path}'"
-            f'" /dev/null'
         )
 
     def _tmux_send_keys(self, keys: list[str]) -> str:
-        escaped_keys = [shlex.quote(key) for key in keys]
+        escaped_keys = [shlex.quote(key.replace("\x00", "")) for key in keys]
         return " ".join(
             [
                 "tmux",
