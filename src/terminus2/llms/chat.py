@@ -30,7 +30,9 @@ def _has_blank_text_block(content: object) -> bool:
 
     Anthropic rejects the block itself -- "messages: text content blocks must
     be non-empty" -- so one blank block spoils the turn however much else it
-    carries.
+    carries. The turn is dropped whole rather than having the block stripped:
+    model-library echoes `RawResponse.response` back to the provider verbatim
+    because it is an opaque signed blob, so editing inside it is not an option.
     """
 
     for block in _blocks(content):
@@ -42,7 +44,11 @@ def _has_blank_text_block(content: object) -> bool:
 
 
 def _carries_content(content: object) -> bool:
-    """Whether a provider would find anything in this content."""
+    """Whether a provider would find anything in this content.
+
+    Whitespace counts as nothing, so a turn whose content is `"   "` goes the
+    same way as one whose content is `""`.
+    """
 
     if isinstance(content, str):
         return bool(content.strip())

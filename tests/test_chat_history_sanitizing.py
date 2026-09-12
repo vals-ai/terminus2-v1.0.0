@@ -77,6 +77,7 @@ def test_a_responses_api_output_list_is_left_alone():
 
     assert _without_unsendable_turns([kept]) == [kept]
 
+
 class _Block:
     """Shaped like a provider content block, which is a model not a dict."""
 
@@ -98,6 +99,13 @@ def test_a_turn_whose_only_text_block_is_empty_is_dropped():
 def test_a_blank_text_block_is_dropped_even_beside_a_thinking_block():
     """Anthropic rejects the blank block itself, not the turn for being empty."""
     blank = _RawResponse(_Message(content=[_Block(type="thinking", thinking="..."), _Block(text="")]))
+
+    assert _without_unsendable_turns([blank]) == []
+
+
+def test_a_blank_block_spoils_a_turn_that_also_says_something():
+    """The populated block goes with it: the payload is echoed back whole."""
+    blank = _RawResponse(_Message(content=[_Block(text="running ls"), _Block(text="")]))
 
     assert _without_unsendable_turns([blank]) == []
 
@@ -134,8 +142,8 @@ def test_a_blank_string_content_is_dropped():
     assert _without_unsendable_turns([blank]) == []
 
 
-def test_a_responses_api_output_list_is_left_alone():
-    """The payload itself is a list of output items, which is not judged."""
+def test_a_responses_api_output_list_holding_content_is_left_alone():
+    """Still not judged when its items carry a content key of their own."""
     kept = _RawResponse([{"type": "message", "content": []}])
 
     assert _without_unsendable_turns([kept]) == [kept]
