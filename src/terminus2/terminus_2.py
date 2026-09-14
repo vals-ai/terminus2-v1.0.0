@@ -777,7 +777,7 @@ so ask everything you need to know."""
 
                     short_prompt = f"Briefly continue this task: {original_instruction}\n\nCurrent state: {limited_screen}\n\nNext steps (2-3 sentences):"
 
-                    short_result: QueryResult = await self._llm.query(prompt=short_prompt)
+                    short_result: QueryResult = await self._llm.query(input=short_prompt)
                     summary_prompt = f"{original_instruction}\n\nSummary: {short_result.output_text}"
                     self._logger.debug("SUMMARIZATION: Short summary succeeded")
                 except Exception as e:
