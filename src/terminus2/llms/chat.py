@@ -2,6 +2,7 @@ import json
 import time
 from functools import reduce
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from model_library.base import LLM, QueryResultMetadata
 from model_library.base.input import InputItem, TextInput
@@ -98,6 +99,26 @@ def _without_unsendable_turns(history: list[InputItem]) -> list[InputItem]:
     return [item for item in history if _is_sendable(item)]
 
 
+def write_query_result(query_result: QueryResult, logging_path: Path | None) -> None:
+    """Retain the SDK result in a unique private log, before caller projections."""
+    if logging_path is None:
+        return
+
+    payload = query_result.model_dump(mode="json", exclude={"history"})
+    # The SDK serializer preserves opaque RawInput/RawResponse provider objects.
+    payload["history"] = json.loads(LLM.serialize_input(query_result.history))
+    logging_path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=logging_path.parent,
+        prefix=f"{logging_path.stem}-",
+        suffix=".json",
+        delete=False,
+    ) as log_file:
+        json.dump(payload, log_file, indent=2)
+
+
 class Chat:
     """Manages conversation history and LLM interactions."""
 
@@ -138,6 +159,8 @@ class Chat:
             history=self.messages,
             **kwargs,
         )
+
+        write_query_result(query_result, logging_path)
 
         # save message history
         self._messages = _without_unsendable_turns(query_result.history)

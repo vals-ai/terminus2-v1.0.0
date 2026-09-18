@@ -21,7 +21,7 @@ from terminus2.agent.context import AgentContext
 from terminus2.agent.name import AgentName
 from terminus2.agent_base import BaseAgent
 from terminus2.environment_base import BaseEnvironment
-from terminus2.llms.chat import Chat
+from terminus2.llms.chat import Chat, write_query_result
 from terminus2.llms.truncator import Truncator
 from terminus2.terminus_json_plain_parser import (
     TerminusJSONPlainParser,
@@ -460,6 +460,10 @@ class Terminus2(BaseAgent):
         response_step_id = prompt_step_id + 1
 
         query_result: QueryResult = await self._llm.query(input=prompt, history=history)
+        write_query_result(
+            query_result,
+            self.logs_dir / f"summarization-{self._summarization_count}-{filename_suffix}.json",
+        )
 
         # Track API request time and accumulate metadata into context
         result_metadata: QueryResultMetadata = query_result.metadata
@@ -778,6 +782,10 @@ so ask everything you need to know."""
                     short_prompt = f"Briefly continue this task: {original_instruction}\n\nCurrent state: {limited_screen}\n\nNext steps (2-3 sentences):"
 
                     short_result: QueryResult = await self._llm.query(input=short_prompt)
+                    write_query_result(
+                        short_result,
+                        logging_path.with_name("short-summary.json") if logging_path is not None else None,
+                    )
                     summary_prompt = f"{original_instruction}\n\nSummary: {short_result.output_text}"
                     self._logger.debug("SUMMARIZATION: Short summary succeeded")
                 except Exception as e:
@@ -834,8 +842,7 @@ so ask everything you need to know."""
             if response_path is not None:
                 response_path.write_text(error_msg)
 
-            # this will overwrite the previous LLM logging
-            # I'm not bothering to change it because it's basically never run
+            # Prompt/response text files are reused; native result logs stay unique.
             return await self._query_llm(
                 chat=chat,
                 prompt=error_msg,
