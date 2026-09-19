@@ -1,7 +1,7 @@
 import copy
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -787,6 +787,26 @@ so ask everything you need to know."""
                         logging_path.with_name("short-summary.json") if logging_path is not None else None,
                     )
                     summary_prompt = f"{original_instruction}\n\nSummary: {short_result.output_text}"
+                    short_steps = [
+                        Step(
+                            step_id=1,
+                            timestamp=datetime.now(UTC).isoformat(),
+                            source="user",
+                            message=short_prompt,
+                        )
+                    ]
+                    # Keep this call's metrics separate from the main chat accounting.
+                    self._append_subagent_response_step(short_steps, 2, short_result, "short summary")
+                    self._pending_subagent_refs = [
+                        self._save_subagent_trajectory(
+                            session_id=f"{self._session_id}-summarization-{self._summarization_count}-short-summary",
+                            agent_name="terminus-2-summarization-short-summary",
+                            steps=short_steps,
+                            result_metadata=short_result.metadata,
+                            filename_suffix="short-summary",
+                            summary_text="Short context summary fallback",
+                        )
+                    ]
                     self._logger.debug("SUMMARIZATION: Short summary succeeded")
                 except Exception as e:
                     self._logger.error(f"SUMMARIZATION: Short summary failed: {e}")
@@ -1341,7 +1361,7 @@ so ask everything you need to know."""
                     timestamp=datetime.now(timezone.utc).isoformat(),
                     source="agent",
                     model_name=step_model,
-                    message=query_result.output_text,
+                    message=query_result.output_text_str,
                     reasoning_content=query_result.reasoning,
                     metrics=Metrics.from_query_result_metadata(metadata),
                     extra=step_extra,
@@ -1355,7 +1375,7 @@ so ask everything you need to know."""
                     timestamp=datetime.now(timezone.utc).isoformat(),
                     source="agent",
                     model_name=self._model_name,
-                    message=query_result.output_text,
+                    message=query_result.output_text_str,
                     reasoning_content=query_result.reasoning,
                 )
             )

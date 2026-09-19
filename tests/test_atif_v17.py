@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from model_library.base import QueryResultMetadata
 
 from terminus2.agent.context import AgentContext
@@ -21,13 +22,20 @@ def test_trajectory_defaults_to_atif_v17() -> None:
     assert Trajectory.model_fields["schema_version"].default == "ATIF-v1.7"
 
 
-def test_query_metadata_is_normalized_without_losing_extension_metrics() -> None:
+@pytest.mark.parametrize(
+    ("duration", "expected_duration"),
+    [(1.25, {"duration_seconds": 1.25}), (0.0, {"duration_seconds": 0.0}), (None, {})],
+)
+def test_query_metadata_is_normalized_without_losing_extension_metrics(
+    duration: float | None, expected_duration: dict[str, float]
+) -> None:
     metadata = QueryResultMetadata(
         in_tokens=11,
         out_tokens=7,
         reasoning_tokens=3,
         cache_read_tokens=5,
         cache_write_tokens=2,
+        duration_seconds=duration,
     )
 
     metrics = Metrics.from_query_result_metadata(metadata)
@@ -39,6 +47,7 @@ def test_query_metadata_is_normalized_without_losing_extension_metrics() -> None
         "extra": {
             "reasoning_tokens": 3,
             "cache_write_tokens": 2,
+            **expected_duration,
         },
     }
 

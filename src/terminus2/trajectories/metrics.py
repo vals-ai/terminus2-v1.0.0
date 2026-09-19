@@ -73,12 +73,13 @@ class Metrics(BaseModel):
 
     @classmethod
     def from_query_result_metadata(cls, metadata: QueryResultMetadata) -> "Metrics":
-        """Normalize model-library token accounting to ATIF v1.6 fields."""
+        """Normalize model-library token accounting and duration to ATIF fields."""
         extra = {
             key: value
             for key, value in {
                 "reasoning_tokens": metadata.reasoning_tokens,
                 "cache_write_tokens": metadata.cache_write_tokens,
+                "duration_seconds": metadata.duration_seconds,
             }.items()
             if value is not None
         }
