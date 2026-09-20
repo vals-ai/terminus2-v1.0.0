@@ -48,6 +48,15 @@ The run writes the Terminus2 output directory to `/logs/terminus2-v1.0.0`, inclu
 - `trajectory.json`
 - `trajectory.cont-*.json` when linear history splits are enabled
 - `trajectory.summarization-*.json` when summarization subagents run
+- `terminal-observations/*.json`: complete returned terminal snapshots before model-facing reduction, under the configured `--logs-dir`
+
+Terminal snapshot records include the original text, UTF-8 byte count and SHA-256,
+archive-relative path, capture phase, episode, applicable command IDs, and a sequence
+scoped to the initial session identity. The sequence continues across trajectory
+splits. These records do not recover output already lost from terminal scrollback.
+Model-facing limits remain unchanged. Capture I/O failures warn without changing
+agent flow; only atomically published `.json` files are complete records, not `.tmp`
+files that may remain after an interrupted write.
 
 ## Run options
 

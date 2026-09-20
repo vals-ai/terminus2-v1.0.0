@@ -1,8 +1,12 @@
 import copy
+import hashlib
+import json
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Literal
 
 from model_library import model
@@ -268,6 +272,8 @@ class Terminus2(BaseAgent):
         self._api_request_times: list[float] = []
         self._n_episodes: int = 0
         self._session_id = session_id if session_id else str(uuid.uuid4())
+        self._terminal_observation_session_id = self._session_id
+        self._terminal_observation_sequence = 0
         self._trajectory_steps: list[Step] = []
         self._completed_trajectory_steps: list[Step] = []
 
@@ -377,6 +383,65 @@ class Terminus2(BaseAgent):
             episode_logging_dir / "prompt.txt",
             episode_logging_dir / "response.txt",
         )
+
+    def _record_terminal_observation(
+        self,
+        output: str,
+        *,
+        phase: Literal["initial", "command_batch", "command_timeout", "short_summary", "ultimate_fallback"],
+        episode: int | None,
+        tool_call_ids: list[str] | None = None,
+    ) -> None:
+        """Keep the returned snapshot before reduction, not a complete process stream.
+
+        Only atomically published JSON files are complete records. Their relative
+        paths, initial session identity and sequence remain stable across trajectory
+        continuations. Failed writes leave a sequence gap and a metadata-only warning.
+        """
+        sequence = self._terminal_observation_sequence
+        self._terminal_observation_sequence += 1
+        output_bytes = output.encode("utf-8")
+        temporary_path: Path | None = None
+        try:
+            directory = self.logs_dir / "terminal-observations"
+            directory.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=directory,
+                prefix=f"{sequence:06d}-",
+                suffix=".tmp",
+                delete=False,
+            ) as record_file:
+                temporary_path = Path(record_file.name)
+                record_path = temporary_path.with_suffix(".json")
+                json.dump(
+                    {
+                        "capture_session_id": self._terminal_observation_session_id,
+                        "session_id": self._session_id,
+                        "sequence": sequence,
+                        "phase": phase,
+                        "episode": episode,
+                        "tool_call_ids": tool_call_ids if tool_call_ids is not None else [],
+                        "path": f"terminal-observations/{record_path.name}",
+                        "byte_count": len(output_bytes),
+                        "sha256": hashlib.sha256(output_bytes).hexdigest(),
+                        "output": output,
+                    },
+                    record_file,
+                    ensure_ascii=False,
+                )
+            temporary_path.replace(record_path)
+        except OSError as error:
+            if temporary_path is not None:
+                with suppress(OSError):
+                    temporary_path.unlink(missing_ok=True)
+            self._logger.warning(
+                "Terminal observation capture incomplete (phase=%s, sequence=%s, error=%s)",
+                phase,
+                sequence,
+                type(error).__name__,
+            )
 
     def _limit_output_length(self, output: str, max_bytes: int = 10000) -> str:
         """
@@ -777,6 +842,9 @@ so ask everything you need to know."""
                 try:
                     self._logger.debug("SUMMARIZATION: Attempting short summary")
                     current_screen = await session.capture_pane(capture_entire=False)
+                    self._record_terminal_observation(
+                        current_screen, phase="short_summary", episode=self._n_episodes - 1,
+                    )
                     limited_screen = current_screen[-1000:] if current_screen else ""
 
                     short_prompt = f"Briefly continue this task: {original_instruction}\n\nCurrent state: {limited_screen}\n\nNext steps (2-3 sentences):"
@@ -815,6 +883,9 @@ so ask everything you need to know."""
             if summary_prompt is None:
                 self._logger.debug("SUMMARIZATION: Using ultimate fallback")
                 current_screen = await session.capture_pane(capture_entire=False)
+                self._record_terminal_observation(
+                    current_screen, phase="ultimate_fallback", episode=self._n_episodes - 1,
+                )
                 limited_screen = current_screen[-1000:] if current_screen else ""
                 summary_prompt = f"{original_instruction}\n\nCurrent state: {limited_screen}"
 
@@ -919,17 +990,23 @@ so ask everything you need to know."""
         self,
         commands: list[Command],
         session: TmuxSession,
+        *,
+        episode: int,
     ) -> tuple[bool, str]:
         """Execute a batch of commands in the terminal.
 
         Args:
             commands: List of commands to execute
             session: TmuxSession instance
+            episode: Episode owning the command batch
 
         Returns:
             Tuple of (timeout_occurred, terminal_output)
         """
-        for command in commands:
+        tool_call_ids = []
+        for index, command in enumerate(commands):
+            if not self._save_raw_content_in_trajectory:
+                tool_call_ids.append(f"call_{episode}_{index + 1}")
             try:
                 await session.send_keys(
                     command.keystrokes,
@@ -937,13 +1014,21 @@ so ask everything you need to know."""
                     min_timeout_sec=command.duration_sec,
                 )
             except TimeoutError:
+                terminal_output = await session.get_incremental_output()
+                self._record_terminal_observation(
+                    terminal_output, phase="command_timeout", episode=episode, tool_call_ids=tool_call_ids,
+                )
                 return True, self._timeout_template.format(
                     timeout_sec=command.duration_sec,
                     command=command.keystrokes,
-                    terminal_state=self._limit_output_length(await session.get_incremental_output()),
+                    terminal_state=self._limit_output_length(terminal_output),
                 )
 
-        return False, self._limit_output_length(await session.get_incremental_output())
+        terminal_output = await session.get_incremental_output()
+        self._record_terminal_observation(
+            terminal_output, phase="command_batch", episode=episode, tool_call_ids=tool_call_ids,
+        )
+        return False, self._limit_output_length(terminal_output)
 
     def _flush_pending_summarization_steps(self) -> None:
         """Record any summarization that happened during the last query.
@@ -1123,6 +1208,7 @@ so ask everything you need to know."""
             timeout_occurred, terminal_output = await self._execute_commands(
                 commands,
                 self._session,
+                episode=episode,
             )
 
             # Capture the pending completion state before potentially modifying it
@@ -1267,7 +1353,9 @@ so ask everything you need to know."""
             raise RuntimeError("Session is not set")
 
         # Get the terminal state for the initial prompt
-        terminal_state = self._limit_output_length(await self._session.get_incremental_output())
+        terminal_output = await self._session.get_incremental_output()
+        self._record_terminal_observation(terminal_output, phase="initial", episode=None)
+        terminal_state = self._limit_output_length(terminal_output)
 
         initial_prompt = self._prompt_template.format(
             instruction=instruction,

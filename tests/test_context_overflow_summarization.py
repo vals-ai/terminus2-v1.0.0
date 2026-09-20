@@ -7,15 +7,18 @@ raises `TypeError` inside the `except Exception` fallback chain, which then
 silently degrades to a canned "Technical difficulties" reply on every turn.
 """
 
-import logging
+import tempfile
 import unittest
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 from model_library.base.output import QueryResult, QueryResultMetadata
 from model_library.exceptions import MaxContextWindowExceededError
 
+from terminus2.llms.chat import Chat
+from terminus2.llms.truncator import Truncator
 from terminus2.terminus_2 import Terminus2
+from terminus2.tmux_session import TmuxSession
 
 
 class FakeLLM:
@@ -39,23 +42,25 @@ def _result(text: str) -> QueryResult:
 
 class ShortSummaryFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_short_summary_queries_the_llm_and_continues_the_chat(self) -> None:
-        agent = object.__new__(Terminus2)
-        agent._api_request_times = []
-        agent._logger = logging.getLogger("test")
-        agent._enable_summarize = True
-        agent._llm = FakeLLM()
-        agent.truncator = SimpleNamespace(unwind=AsyncMock())
+        logs_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        agent = Terminus2(
+            logs_dir=logs_dir, model_name="synthetic/offline", llm=FakeLLM()
+        )
+        agent._n_episodes = 1
+        agent.truncator = MagicMock(spec=Truncator, unwind=AsyncMock())
         agent._summarize = AsyncMock(
             side_effect=RuntimeError("full summary unavailable")
         )
 
-        chat = SimpleNamespace(
+        chat = MagicMock(
+            spec=Chat,
             chat=AsyncMock(
                 side_effect=[MaxContextWindowExceededError(), _result("ls -la")]
-            )
+            ),
         )
-        session = SimpleNamespace(
-            capture_pane=AsyncMock(return_value="$ make\nerror: missing target")
+        session = MagicMock(
+            spec=TmuxSession,
+            capture_pane=AsyncMock(return_value="$ make\nerror: missing target"),
         )
 
         result = await agent._query_llm(

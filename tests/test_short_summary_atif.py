@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import terminus2.terminus_2 as terminus_module
 from model_library.base.output import QueryResult, QueryResultMetadata
 from model_library.exceptions import MaxContextWindowExceededError
 from terminus2.agent.context import AgentContext
@@ -12,12 +13,13 @@ from terminus2.terminus_2 import Terminus2
 
 
 @pytest.mark.parametrize(
-    ("duration", "summary_fails", "reasoning_only"),
-    [(1.25, False, False), (0.0, False, False), (None, False, False),
-     (None, True, False), (0.0, False, True)],
+    ("duration", "summary_fails", "reasoning_only", "capture_fails"),
+    [(1.25, False, False, False), (0.0, False, False, False), (None, False, False, False),
+     (None, True, False, False), (0.0, False, True, False),
+     (1.25, False, False, True), (None, True, False, True)],
 )
 def test_short_summary_is_linked_without_changing_main_call_accounting(
-    tmp_path, duration, summary_fails, reasoning_only, monkeypatch
+    tmp_path, duration, summary_fails, reasoning_only, capture_fails, monkeypatch, caplog,
 ):
     # The only model boundary is synthetic; reject any accidental network access.
     def no_network(*args, **kwargs):
@@ -63,13 +65,19 @@ def test_short_summary_is_linked_without_changing_main_call_accounting(
     agent._summarization_count = 2
     monkeypatch.setattr(agent, "truncator", SimpleNamespace(unwind=AsyncMock(), context_limit=10000))
     agent._summarize = AsyncMock(side_effect=RuntimeError("full summary unavailable"))
-    screen = "$ make\nmissing target"
-    monkeypatch.setattr(agent, "_session", SimpleNamespace(
+    screen = "NATIVE_SCREEN_PREFIX" + "é" * 1500 + "$ make\nmissing target"
+    limited_screen = screen[-1000:]
+    if capture_fails:
+        def fail_capture(**kwargs):
+            raise OSError("PRIVATE_CAPTURE_ERROR")
+        monkeypatch.setattr(terminus_module, "NamedTemporaryFile", fail_capture)
+    session = SimpleNamespace(
         is_session_alive=AsyncMock(return_value=True),
         capture_pane=AsyncMock(return_value=screen),
         send_keys=AsyncMock(),
         get_incremental_output=AsyncMock(return_value="model-visible terminal output"),
-    ))
+    )
+    monkeypatch.setattr(agent, "_session", session)
     chat = Chat(llm, metrics_dir=tmp_path)
 
     asyncio.run(agent._run_agent_loop("continue", chat, tmp_path, "Build the project"))
@@ -77,17 +85,35 @@ def test_short_summary_is_linked_without_changing_main_call_accounting(
     assert len(calls) == 3
     assert calls[1] == (
         (
-            f"Briefly continue this task: Build the project\n\nCurrent state: {screen}"
+            f"Briefly continue this task: Build the project\n\nCurrent state: {limited_screen}"
             "\n\nNext steps (2-3 sentences):"
         ),
         (),
     )
     expected_prompt = (
-        f"Build the project\n\nCurrent state: {screen}" if summary_fails
+        f"Build the project\n\nCurrent state: {limited_screen}" if summary_fails
         else "Build the project\n\nSummary: None" if reasoning_only
         else "Build the project\n\nSummary: finish the build"
     )
     assert calls[2][0] == expected_prompt
+    assert session.capture_pane.await_count == (2 if summary_fails else 1)
+    assert session.get_incremental_output.await_count == 1
+    records = [json.loads(path.read_text()) for path in sorted(
+        (tmp_path / "terminal-observations").glob("*.json")
+    )]
+    if capture_fails:
+        assert records == []
+        assert "capture incomplete" in caplog.text
+        assert "PRIVATE_CAPTURE_ERROR" not in caplog.text
+    else:
+        expected_phases = ["short_summary"]
+        if summary_fails:
+            expected_phases.append("ultimate_fallback")
+        assert [r["phase"] for r in records] == expected_phases + ["command_batch"]
+        assert [r["sequence"] for r in records] == list(range(len(records)))
+        assert all(r["episode"] == 0 for r in records)
+        assert all(r["output"] == screen and r["tool_call_ids"] == [] for r in records[:-1])
+        assert records[-1]["tool_call_ids"] == ["call_0_1"]
     assert agent._api_request_times == [250]
     assert agent._context.n_input_tokens == 2
     assert agent._context.n_output_tokens == 4
