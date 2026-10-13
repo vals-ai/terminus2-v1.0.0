@@ -2,7 +2,7 @@
 
 Terminus2 contract for Valkyrie. The wrapper installs Terminus2, runs it against the task prompt, and writes the trajectory under `/logs/terminus2-v1.0.0`.
 
-For local CLI usage, install the package with `uv sync` and run `terminus2 --help`.
+For local CLI usage, install with `uv sync` and run `terminus2 --help`. For direct-provider calls, use `uv sync --extra providers`; the bundle installer selects it for `NO_MODEL_GATEWAY=True` or absent `MODEL_GATEWAY_URL`. Both retain `model-library==0.1.28`. Terminus declares its own `tenacity` import independently of provider SDKs.
 
 ## Configuration
 

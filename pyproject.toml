@@ -10,8 +10,12 @@ dependencies = [
     "jinja2>=3.1.6",
     "model-library==0.1.28",
     "shortuuid>=1.0.13",
+    "tenacity>=8.5.0",
     "toml>=0.10.2",
 ]
+
+[project.optional-dependencies]
+providers = ["model-library[providers]==0.1.28"]
 
 [project.scripts]
 terminus2 = "terminus2.cli:main"
