@@ -6,7 +6,11 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -q curl
 
 # Install uv
-curl -LsSf https://astral.sh/uv/0.7.13/install.sh | sh
+uv_installer="$(mktemp)"
+curl -LsSf https://astral.sh/uv/0.13.5/install.sh -o "$uv_installer"
+printf '%s  %s\n' '1c6e7f025499664633ac2dce43a210800510e9ef0625c52e034a8afdf8bf177a' "$uv_installer" | sha256sum -c -
+sh "$uv_installer"
+rm "$uv_installer"
 
 # Install the package
 /root/.local/bin/uv sync

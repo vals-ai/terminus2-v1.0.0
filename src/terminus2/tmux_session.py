@@ -247,39 +247,40 @@ class TmuxSession:
 
     async def _install_asciinema_with_pip(self) -> None:
         """
-        Install asciinema using pip as a fallback.
+        Install asciinema using age-gated uv pip as a fallback.
         """
         try:
-            # Try to install python3-pip first - with non-interactive flags
-            pip_install_commands = [
-                "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip",
-                "yum install -y python3-pip",
-                "dnf install -y python3-pip",
-                "apk add --no-cache python3 py3-pip",
+            bootstrap_commands = [
+                "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 curl",
+                "yum install -y python3 curl",
+                "dnf install -y python3 curl",
+                "apk add --no-cache python3 curl",
             ]
-
-            # Try to install pip
-            for cmd in pip_install_commands:
+            for cmd in bootstrap_commands:
                 result = await self.environment.exec(command=cmd)
                 if result.return_code == 0:
                     break
 
-            # Install asciinema using pip
-            pip_commands = ["pip3 install asciinema", "pip install asciinema"]
+            result = await self.environment.exec(
+                command=(
+                    "set -e; installer=$(mktemp); "
+                    'curl -LsSf https://astral.sh/uv/0.13.5/install.sh -o "$installer"; '
+                    "printf '%s  %s\\n' '1c6e7f025499664633ac2dce43a210800510e9ef0625c52e034a8afdf8bf177a' "
+                    '"$installer" | sha256sum -c -; '
+                    'UV_UNMANAGED_INSTALL=/usr/local/bin sh "$installer"; rm "$installer"; '
+                    "/usr/local/bin/uv pip install --system --exclude-newer '7 days' asciinema"
+                )
+            )
+            if result.return_code == 0:
+                verify_result = await self.environment.exec(command="asciinema --version")
+                if verify_result.return_code == 0:
+                    self._logger.debug("asciinema successfully installed using uv pip")
+                    return
 
-            for cmd in pip_commands:
-                result = await self.environment.exec(command=cmd)
-                if result.return_code == 0:
-                    # Verify installation
-                    verify_result = await self.environment.exec(command="asciinema --version")
-                    if verify_result.return_code == 0:
-                        self._logger.debug("asciinema successfully installed using pip")
-                        return
-
-            self._logger.error("Failed to install asciinema using pip")
+            self._logger.error("Failed to install asciinema using uv pip")
 
         except Exception as e:
-            self._logger.error(f"Failed to install asciinema with pip: {e}")
+            self._logger.error(f"Failed to install asciinema with uv pip: {e}")
 
     @property
     def _tmux_start_session(self) -> str:
