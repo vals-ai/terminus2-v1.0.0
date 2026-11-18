@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from model_library.base import QueryResultMetadata
+from model_library.base.output import FallbackHop, FallbackInfo
 
 from terminus2.agent.context import AgentContext
 from terminus2.terminus_2 import Terminus2, _model_routing
@@ -144,10 +145,18 @@ def test_model_routing_records_confirmed_fallback() -> None:
     metadata = QueryResultMetadata(
         in_tokens=1,
         out_tokens=1,
-        extra={
-            "anthropic_response_model": "claude-opus-4-8",
-            "fallback": True,
-        },
+        fallback=FallbackInfo(
+            requested_model="anthropic/claude-sonnet-4-6",
+            served_model="anthropic/claude-opus-4-8",
+            hops=[
+                FallbackHop(
+                    model="anthropic/claude-opus-4-8",
+                    served=True,
+                    usage=QueryResultMetadata(in_tokens=1, out_tokens=1),
+                )
+            ],
+        ),
+        extra={"anthropic_response_model": "claude-opus-4-8"},
     )
 
     assert _model_routing(metadata, "anthropic/claude-sonnet-4-6") == (
